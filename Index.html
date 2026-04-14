@@ -1,0 +1,2724 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>入院予兆分析 PRO</title>
+    
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/xlsx-js-style@1.2.0/dist/xlsx.min.js"></script>
+
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    fontFamily: {
+                        sans: ['Helvetica Neue', 'Arial', 'Hiragino Kaku Gothic ProN', 'Hiragino Sans', 'Meiryo', 'sans-serif'],
+                    }
+                }
+            }
+        }
+    </script>
+    <style>
+        .custom-scrollbar::-webkit-scrollbar { width: 6px; }
+        .custom-scrollbar::-webkit-scrollbar-track { background: #f1f1f1; border-radius: 4px; }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
+        .custom-scrollbar::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+        
+        @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+        @keyframes slideInRight { from { transform: translateX(20px); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
+        
+        .animate-in.fade-in { animation: fadeIn 0.2s ease-out forwards; }
+        .animate-in.slide-in-from-right-4 { animation: slideInRight 0.3s ease-out forwards; }
+
+        .user-sidebar-item.active {
+            background-color: #eff6ff;
+            border-left: 4px solid #3b82f6;
+            color: #1e40af;
+        }
+    </style>
+</head>
+<body class="bg-slate-50 text-slate-800 font-sans min-h-screen overflow-hidden">
+
+    <div id="root" class="h-screen bg-slate-50 flex flex-col text-slate-800 font-sans relative"></div>
+
+    <script>
+        const DB_NAME = 'MedicalAnalysisProDB';
+        const DB_VERSION = 1;
+        const STORE_HISTORY = 'history';
+        const STORE_STATUS = 'userStatus';
+
+        const dbOpener = () => {
+            return new Promise((resolve, reject) => {
+                const request = indexedDB.open(DB_NAME, DB_VERSION);
+                request.onupgradeneeded = (e) => {
+                    const db = e.target.result;
+                    if (!db.objectStoreNames.contains(STORE_HISTORY)) db.createObjectStore(STORE_HISTORY, { keyPath: 'id' });
+                    if (!db.objectStoreNames.contains(STORE_STATUS)) db.createObjectStore(STORE_STATUS, { keyPath: 'uid' });
+                };
+                request.onsuccess = (e) => resolve(e.target.result);
+                request.onerror = (e) => reject(e.target.error);
+            });
+        };
+
+        const dbAction = async (storeName, mode, callback) => {
+            try {
+                const db = await dbOpener();
+                const tx = db.transaction(storeName, mode);
+                const store = tx.objectStore(storeName);
+                const result = await callback(store);
+                return new Promise((resolve, reject) => {
+                    tx.oncomplete = () => {
+                        db.close(); 
+                        resolve(result);
+                    };
+                    tx.onerror = (e) => {
+                        db.close();
+                        reject(e.target.error);
+                    };
+                });
+            } catch (err) {
+                console.error("DBアクセスエラーだぜ: ", err);
+                return null;
+            }
+        };
+
+        const DB = {
+            getAllHistory: () => dbAction(STORE_HISTORY, 'readonly', s => new Promise(r => {
+                const req = s.getAll();
+                req.onsuccess = () => r((req.result || []).sort((a, b) => b.id.localeCompare(a.id)));
+            })),
+            saveHistory: (historyObj) => dbAction(STORE_HISTORY, 'readwrite', s => s.put(historyObj)),
+            deleteHistory: (id) => dbAction(STORE_HISTORY, 'readwrite', s => s.delete(id)),
+            clearAllHistory: () => dbAction(STORE_HISTORY, 'readwrite', s => s.clear()),
+            getStatusMap: () => dbAction(STORE_STATUS, 'readonly', s => new Promise(r => {
+                const req = s.getAll();
+                req.onsuccess = () => {
+                    const map = {};
+                    (req.result || []).forEach(item => map[item.uid] = item);
+                    r(map);
+                };
+            })),
+            updateStatus: (statusObj) => dbAction(STORE_STATUS, 'readwrite', s => s.put(statusObj)),
+            clearAllStatus: () => dbAction(STORE_STATUS, 'readwrite', s => s.clear())
+        };
+
+        const isValidVital = (item, val) => {
+            if (val === null || val === undefined || val === '') return false;
+            const num = parseFloat(val);
+            if (isNaN(num)) return false;
+            
+            if (num === 9999) return false;
+
+            const categoryItems = ['turgor', 'anorexia', 'medRecord', 'backPain', 'urinationPain', 'angina', 'oralEnv', 'fallHistory'];
+            if (categoryItems.includes(item)) {
+                return [10, 20, 30].includes(num); 
+            } 
+
+            if (num < 0) return false;
+            if (item !== 'waterIntake' && num >= 1000) return false; 
+            if (item === 'waterIntake' && num >= 10000) return false; 
+            if (item === 'temp' && num >= 45) return false; 
+            if (item === 'spo2' && num > 100) return false; 
+            if (item === 'pulse' && num < 10) return false; 
+            if (item === 'sleepTime' && num > 1440) return false; 
+
+            return true;
+        };
+        
+        const getValidVital = (item, val) => isValidVital(item, val) ? parseFloat(val) : null;
+
+        let activeElementId = null;
+        let activeSelectionStart = null;
+        let activeSelectionEnd = null;
+
+        function saveFocus() {
+            const active = document.activeElement;
+            if (active && (active.tagName === 'TEXTAREA' || active.tagName === 'INPUT')) {
+                activeElementId = active.id;
+                activeSelectionStart = active.selectionStart;
+                activeSelectionEnd = active.selectionEnd;
+            } else {
+                activeElementId = null;
+            }
+        }
+
+        function restoreFocus() {
+            if (activeElementId) {
+                const el = document.getElementById(activeElementId);
+                if (el) {
+                    el.focus();
+                    try { el.setSelectionRange(activeSelectionStart, activeSelectionEnd); } catch(e){}
+                }
+            }
+        }
+
+        let state = {
+            loading: true,
+            historyList: [],
+            manualStatus: {},
+            selectedUserId: null,
+            view: 'dashboard', 
+            selectedOffice: localStorage.getItem('last_selected_office') || 'すべて',
+            statusFilter: 'all', 
+            alertFilter: 'all', 
+            searchQuery: '',
+            graphPeriod: '1m',
+            customStartDate: '', 
+            customEndDate: '',   
+            uploadStatus: { isUploading: false, message: '' },
+            uploadSuccessMessage: '',
+            confirmModal: null,
+            selectedHistoryIds: [],
+            alertModalUid: null,
+            alertModalMode: 'alertOnly',
+            expandedGroups: {},
+            isSidebarOpen: true,
+            csvExportModal: null
+        };
+
+        let processedData = {
+            userList: [],
+            userStatsMap: {},
+            offices: ['すべて']
+        };
+
+        let chartInstances = {};
+
+        const catLabels = {
+            turgor: { 10: '遅延なし', 20: '3秒以上の遅延' },
+            anorexia: { 10: '減少無し', 20: 'わずかに減少(8割未満)', 30: '明らかに減少(5割未満)' },
+            medRecord: { 10: '服薬数5種類以下・服薬コンプライアンス問題なし', 20: '服薬数5種類以上または服薬コンプライアンス問題あり', 30: '服薬数5種類以上・服薬コンプライアンス問題あり' },
+            backPain: { 10: 'なし', 20: '軽度の痛み(片側)', 30: '重度の痛み(片側)' },
+            urinationPain: { 10: 'なし', 20: 'あり' },
+            angina: { 10: 'なし', 20: '軽度の不定期な症状', 30: '頻繁、または重度の症状' },
+            oralEnv: { 10: '問題なし', 20: '軽度(歯肉炎)疑い', 30: '重度(歯周病)疑い' },
+            fallHistory: { 10: 'なし', 20: 'あり' }
+        };
+
+        const catLabelsTitle = {
+            turgor: 'ツルゴール', anorexia: '食欲不振', medRecord: '服薬記録',
+            backPain: '背部痛', urinationPain: '排尿時痛', angina: '狭心痛', oralEnv: '口腔環境',
+            fallHistory: '転倒歴'
+        };
+
+        const displayOrder = [
+            'bp', 'pulse', 'spo2', 'temp', 'respRate', 'weight', 'bmi', 'bloodSugar', 'sleepTime', 'waterIntake', 'walkTime5m',
+            'medRecord', 'oralEnv', 'turgor', 'anorexia', 'backPain', 'urinationPain', 'angina', 'fallHistory'
+        ];
+
+        function setState(newState) {
+            if (newState.selectedOffice) localStorage.setItem('last_selected_office', newState.selectedOffice);
+
+            let needsProcess = false;
+            const triggerKeys = ['manualStatus', 'selectedOffice', 'statusFilter', 'alertFilter', 'historyList', 'searchQuery'];
+            if (Object.keys(newState).some(k => triggerKeys.includes(k))) {
+                needsProcess = true;
+            }
+            
+            saveFocus(); 
+            
+            const dashScroll = document.getElementById('dashboard-scroll-container');
+            const dashScrollPos = dashScroll ? dashScroll.scrollTop : 0;
+            
+            const detailScroll = document.getElementById('detail-scroll-container');
+            const detailScrollPos = detailScroll ? detailScroll.scrollTop : 0;
+            
+            const sidebarScroll = document.getElementById('sidebar-scroll-container');
+            const sidebarScrollPos = sidebarScroll ? sidebarScroll.scrollTop : 0;
+
+            state = { ...state, ...newState };
+            
+            if (needsProcess) {
+                processDataForView();
+            }
+            
+            const renderSkipKeys = ['expandedGroups', 'isSidebarOpen'];
+            const keys = Object.keys(newState);
+            const canSkipRender = keys.length > 0 && keys.every(k => renderSkipKeys.includes(k));
+
+            if (!canSkipRender) {
+                render(); 
+                
+                setTimeout(() => {
+                    const newDashScroll = document.getElementById('dashboard-scroll-container');
+                    if (newDashScroll) newDashScroll.scrollTop = dashScrollPos;
+                    
+                    const newDetailScroll = document.getElementById('detail-scroll-container');
+                    if (newDetailScroll) newDetailScroll.scrollTop = detailScrollPos;
+                    
+                    const newSidebarScroll = document.getElementById('sidebar-scroll-container');
+                    if (newSidebarScroll) newSidebarScroll.scrollTop = sidebarScrollPos;
+                }, 0);
+            }
+            
+            restoreFocus(); 
+        }
+
+        const escapeHtml = (unsafe) => (unsafe || '').toString().replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#039;");
+        
+        const hiraToKana = (str) => str.replace(/[\u3041-\u3096]/g, match => String.fromCharCode(match.charCodeAt(0) + 0x60));
+        const normalizeForSearch = (str) => hiraToKana((str || '').toLowerCase().replace(/[\s　]/g, ''));
+        
+        const parseCSVRow = (str) => {
+            const result = []; let cell = ''; let inQuotes = false;
+            for (let i = 0; i < str.length; i++) {
+                const char = str[i];
+                if (char === '"' && str[i + 1] === '"') { cell += '"'; i++; } 
+                else if (char === '"') { inQuotes = !inQuotes; } 
+                else if (char === ',' && !inQuotes) { result.push(cell); cell = ''; } 
+                else { cell += char; }
+            }
+            result.push(cell); 
+            return result.map(v => {
+                let trimmed = v.trim();
+                if (trimmed.startsWith('"') && trimmed.endsWith('"')) {
+                    trimmed = trimmed.substring(1, trimmed.length - 1);
+                }
+                return trimmed;
+            });
+        };
+
+        const formatDate = (dateObj) => {
+            const y = dateObj.getFullYear();
+            const m = String(dateObj.getMonth() + 1).padStart(2, '0');
+            const d = String(dateObj.getDate()).padStart(2, '0');
+            const h = String(dateObj.getHours()).padStart(2, '0');
+            const min = String(dateObj.getMinutes()).padStart(2, '0');
+            return `${y}/${m}/${d} ${h}:${min}`;
+        };
+
+        const formatSleepTime = (minutes) => {
+            if (minutes === null || minutes === undefined || isNaN(minutes)) return '-';
+            const h = Math.floor(minutes / 60);
+            const m = Math.round(minutes % 60);
+            if (h > 0 && m > 0) return `${h}時間${m}分`;
+            if (h > 0) return `${h}時間`;
+            return `${m}分`;
+        };
+
+        const formatDev = (val, isTemp = false, isSleep = false) => {
+            if (val === undefined || val === null || isNaN(val)) return '<span class="text-slate-300 text-[10px] font-bold">-</span>';
+            const num = parseFloat(val);
+            let absStr = Math.abs(num).toFixed(isTemp ? 1 : 0);
+            
+            if (isSleep) {
+                const absNum = Math.abs(num);
+                const h = Math.floor(absNum / 60);
+                const m = Math.round(absNum % 60);
+                absStr = h > 0 ? (m > 0 ? `${h}h${m}m` : `${h}h`) : `${m}m`;
+            }
+
+            if(num > 0) return `<span class="text-red-500 flex items-center justify-center gap-0.5"><i data-lucide="trending-up" class="w-3 h-3"></i>${absStr}</span>`;
+            if(num < 0) return `<span class="text-blue-500 flex items-center justify-center gap-0.5"><i data-lucide="trending-down" class="w-3 h-3"></i>${absStr}</span>`;
+            return `<span class="text-slate-400 flex items-center justify-center gap-0.5"><i data-lucide="minus" class="w-3 h-3"></i>0</span>`;
+        };
+
+        const formatDevForCSV = (dev, isTemp, isSleep) => {
+            if (dev === undefined || dev === null) return '-';
+            if (isSleep) {
+                const absNum = Math.abs(dev);
+                const h = Math.floor(absNum / 60);
+                const m = Math.round(absNum % 60);
+                const str = h > 0 ? (m > 0 ? `${h}h${m}m` : `${h}h`) : `${m}m`;
+                return dev > 0 ? `+${str}` : (dev < 0 ? `-${str}` : str);
+            }
+            return dev > 0 ? `+${dev.toFixed(isTemp ? 1 : 0)}` : dev.toFixed(isTemp ? 1 : 0);
+        };
+
+        function checkAlertStatus(u) {
+            if (!u.alerts || u.alerts.length === 0) return { hasRed: false };
+            
+            const latestTime = u.allRecords && u.allRecords.length > 0 
+                ? new Date(u.allRecords[u.allRecords.length - 1].date).getTime() 
+                : Date.now();
+            const thirtyDaysMs = 30 * 24 * 60 * 60 * 1000;
+            
+            let hasRed = false;
+            for (const a of u.alerts) {
+                const isWarningOrOk = a.message.includes('OK') || a.message.includes('正常') || a.message.includes('注意');
+                const isExplicitAlert = a.message.includes('警報');
+                const isAlert = isExplicitAlert || !isWarningOrOk;
+                const alertTime = new Date(a.date).getTime();
+                
+                if (isAlert && !isNaN(alertTime) && (latestTime - alertTime) <= thirtyDaysMs) {
+                    hasRed = true;
+                    break;
+                }
+            }
+            return { hasRed };
+        }
+
+        async function initApp() {
+            try {
+                const [history, status] = await Promise.all([DB.getAllHistory(), DB.getStatusMap()]);
+                setState({ historyList: history || [], manualStatus: status || {}, loading: false });
+                window.addEventListener('keydown', handleKeyDown);
+            } catch (e) { 
+                console.error("DB初期化エラー", e);
+                setState({ loading: false });
+            }
+        }
+
+        function handleKeyDown(e) {
+            if (state.loading || (state.view !== 'dashboard' && state.view !== 'user-detail')) return;
+            if (state.confirmModal || state.alertModalUid || state.csvExportModal) return; 
+            if (e.target.tagName === 'TEXTAREA' || e.target.tagName === 'INPUT') return;
+            
+            const userList = processedData.userList;
+            if (userList.length === 0) return;
+            
+            let currentIndex = -1;
+            if (state.view === 'user-detail') {
+                currentIndex = userList.findIndex(u => u.uid === state.selectedUserId);
+            }
+
+            if (e.key === 'ArrowDown') {
+                e.preventDefault();
+                let nextIndex = currentIndex + 1;
+                if (nextIndex >= userList.length) nextIndex = -1;
+                
+                if (nextIndex === -1) {
+                    window.showDashboard();
+                    scrollSidebarItemIntoView(null);
+                } else {
+                    window.setSelectedUserId(userList[nextIndex].uid);
+                    scrollSidebarItemIntoView(userList[nextIndex].uid);
+                }
+            } else if (e.key === 'ArrowUp') {
+                e.preventDefault();
+                let prevIndex = currentIndex - 1;
+                if (prevIndex < -1) prevIndex = userList.length - 1;
+                
+                if (prevIndex === -1) {
+                    window.showDashboard();
+                    scrollSidebarItemIntoView(null);
+                } else {
+                    window.setSelectedUserId(userList[prevIndex].uid);
+                    scrollSidebarItemIntoView(userList[prevIndex].uid);
+                }
+            }
+        }
+
+        function scrollSidebarItemIntoView(uid) {
+            setTimeout(() => {
+                const el = uid ? document.querySelector(`[data-user-id="${uid}"]`) : document.getElementById('sidebar-item-dashboard');
+                if (el) el.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+            }, 50);
+        }
+
+        function generateStats(records) {
+            const userStats = {};
+            const cleanStr = (s) => (s || '').toString().replace(/[\s　]/g, '');
+
+            records.forEach(record => {
+                if (!record.lastName && !record.firstName && !record.officeName) return; 
+
+                const uid = `${cleanStr(record.lastName)}_${cleanStr(record.firstName)}`;
+                
+                if (!userStats[uid]) {
+                    userStats[uid] = {
+                        uid, 
+                        name: `${cleanStr(record.lastName)} ${cleanStr(record.firstName)}`.trim() || '名称未設定',
+                        kanaName: `${cleanStr(record.kanaLast)} ${cleanStr(record.kanaFirst)}`.trim(),
+                        officeName: record.officeName || '未所属',
+                        birthDate: record.birthDate, allRecords: [], overallAverages: {},
+                        lastMonthAverages: {}, monthlyAveragesArr: [], isDiscontinued: false,
+                        discontinueReason: '', discontinueDate: null, discontinueNote: '',
+                        alerts: [] 
+                    };
+                } else {
+                    if (userStats[uid].officeName === '未所属' && record.officeName) {
+                        userStats[uid].officeName = record.officeName;
+                    }
+                }
+                
+                const stats = userStats[uid];
+                stats.allRecords.push({ 
+                    date: record.date, 
+                    sysBP: record.sysBP, diaBP: record.diaBP, pulse: record.pulse, spo2: record.spo2, temp: record.temp,
+                    bmi: record.bmi, weight: record.weight, bloodSugar: record.bloodSugar, respRate: record.respRate,
+                    turgor: record.turgor, anorexia: record.anorexia, medRecord: record.medRecord,
+                    backPain: record.backPain, urinationPain: record.urinationPain, angina: record.angina, oralEnv: record.oralEnv,
+                    sleepTime: record.sleepTime, waterIntake: record.waterIntake, walkTime5m: record.walkTime5m, fallHistory: record.fallHistory
+                });
+
+                if (record.alertMsg && record.alertMsg.toString().trim() !== '' && record.alertMsg.toString().trim() !== '-') {
+                    stats.alerts.push({ date: record.date, message: record.alertMsg.toString().trim() });
+                }
+                
+                if (record.isDiscontinued) {
+                    stats.isDiscontinued = true;
+                    if (record.discontinueDate) stats.discontinueDate = record.discontinueDate;
+                    if (record.discontinueReason) stats.discontinueReason = record.discontinueReason;
+                    if (record.discontinueNote) stats.discontinueNote = record.discontinueNote;
+                }
+            });
+
+            return userStats;
+        }
+
+        function processDataForView() {
+            processedData = { userList: [], userStatsMap: {}, offices: ['すべて'] };
+            if (state.historyList.length === 0) return;
+
+            const mergedUserStatsMap = {};
+            const offices = new Set();
+            const items = ['sysBP', 'diaBP', 'pulse', 'spo2', 'temp', 'bmi', 'weight', 'bloodSugar', 'respRate', 'turgor', 'anorexia', 'medRecord', 'backPain', 'urinationPain', 'angina', 'oralEnv', 'sleepTime', 'waterIntake', 'walkTime5m', 'fallHistory'];
+
+            state.historyList.forEach(h => {
+                Object.keys(h.userStatsMap).forEach(uid => {
+                    const stats = h.userStatsMap[uid];
+                    if (!mergedUserStatsMap[uid]) {
+                        mergedUserStatsMap[uid] = {
+                            uid: stats.uid,
+                            name: stats.name,
+                            kanaName: stats.kanaName,
+                            officeName: stats.officeName,
+                            birthDate: stats.birthDate,
+                            allRecords: [],
+                            overallAverages: {},
+                            lastMonthAverages: {},
+                            monthlyAveragesArr: [],
+                            isDiscontinued: stats.isDiscontinued,
+                            discontinueReason: stats.discontinueReason,
+                            discontinueDate: stats.discontinueDate,
+                            discontinueNote: stats.discontinueNote || '',
+                            alerts: []
+                        };
+                    }
+                    if (stats.officeName && stats.officeName !== '未所属') {
+                        mergedUserStatsMap[uid].officeName = stats.officeName;
+                    }
+                    if (state.manualStatus[uid]) {
+                        if (state.manualStatus[uid].isDiscontinued !== undefined) mergedUserStatsMap[uid].isDiscontinued = state.manualStatus[uid].isDiscontinued;
+                        if (state.manualStatus[uid].discontinueReason !== undefined) mergedUserStatsMap[uid].discontinueReason = state.manualStatus[uid].discontinueReason;
+                        if (state.manualStatus[uid].discontinueDate !== undefined) mergedUserStatsMap[uid].discontinueDate = state.manualStatus[uid].discontinueDate;
+                        if (state.manualStatus[uid].discontinueNote !== undefined) mergedUserStatsMap[uid].discontinueNote = state.manualStatus[uid].discontinueNote;
+                    }
+
+                    if (stats.alerts && stats.alerts.length > 0) {
+                        mergedUserStatsMap[uid].alerts.push(...stats.alerts);
+                    }
+
+                    const existingDates = new Set(mergedUserStatsMap[uid].allRecords.map(r => r.date));
+                    stats.allRecords.forEach(r => {
+                        if (!existingDates.has(r.date)) {
+                            mergedUserStatsMap[uid].allRecords.push({ ...r });
+                            existingDates.add(r.date);
+                        }
+                    });
+                });
+            });
+
+            Object.keys(mergedUserStatsMap).forEach(uid => {
+                const stats = mergedUserStatsMap[uid];
+                offices.add(stats.officeName || '未所属');
+                
+                stats.allRecords.sort((a, b) => {
+                    const da = new Date(a.date || 0).getTime();
+                    const db = new Date(b.date || 0).getTime();
+                    if (!isNaN(da) && !isNaN(db)) return da - db;
+                    return (a.date || '').localeCompare(b.date || '');
+                });
+                
+                items.forEach(item => {
+                    const values = stats.allRecords.map(r => getValidVital(item, r[item])).filter(v => v !== null);
+                    if (values.length > 0) stats.overallAverages[item] = values.reduce((a, b) => a + b, 0) / values.length;
+                });
+
+                if (stats.allRecords.length > 0) {
+                    const latestDate = new Date(stats.allRecords[stats.allRecords.length - 1].date);
+                    const lastMonthRecords = stats.allRecords.filter(r => {
+                        const d = new Date(r.date);
+                        if (isNaN(d.getTime())) return false;
+                        return Math.ceil(Math.abs(latestDate - d) / (1000 * 60 * 60 * 24)) <= 30;
+                    });
+                    items.forEach(item => {
+                        const values = lastMonthRecords.map(r => getValidVital(item, r[item])).filter(v => v !== null);
+                        if (values.length > 0) stats.lastMonthAverages[item] = values.reduce((a, b) => a + b, 0) / values.length;
+                    });
+                }
+
+                stats.allRecords = stats.allRecords.map(r => {
+                    const deviations = {};
+                    items.forEach(item => {
+                        const val = getValidVital(item, r[item]);
+                        if (stats.overallAverages[item] !== undefined && val !== null) {
+                            deviations[item] = val - stats.overallAverages[item];
+                        } else {
+                            deviations[item] = null;
+                        }
+                    });
+                    return { ...r, deviations };
+                });
+            });
+
+            let userList = Object.values(mergedUserStatsMap).sort((a, b) => a.kanaName.localeCompare(b.kanaName, 'ja'));
+            
+            if (state.selectedOffice !== 'すべて') {
+                userList = userList.filter(u => u.officeName === state.selectedOffice);
+            }
+            
+            if (state.statusFilter === 'active') {
+                userList = userList.filter(u => !u.isDiscontinued);
+            } else if (state.statusFilter === 'discontinued') {
+                userList = userList.filter(u => u.isDiscontinued);
+            }
+
+            if (state.alertFilter === 'hasAlert') {
+                userList = userList.filter(u => checkAlertStatus(u).hasRed);
+            } else if (state.alertFilter === 'noAlert') {
+                userList = userList.filter(u => !checkAlertStatus(u).hasRed);
+            }
+
+            if (state.searchQuery) {
+                const q = normalizeForSearch(state.searchQuery);
+                userList = userList.filter(u => normalizeForSearch(u.name).includes(q) || normalizeForSearch(u.kanaName).includes(q));
+            }
+
+            processedData = { userList, userStatsMap: mergedUserStatsMap, offices: ['すべて', ...Array.from(offices).sort()] };
+        }
+
+        window.applySearchFilter = (q) => {
+            const normalizedQ = normalizeForSearch(q);
+            let visibleSidebarCount = 0;
+            const groups = document.querySelectorAll('.sidebar-group');
+            
+            groups.forEach(group => {
+                const items = group.querySelectorAll('.user-sidebar-item[data-search-target="true"]');
+                let visibleCountInGroup = 0;
+                
+                items.forEach(item => {
+                    const name = normalizeForSearch(item.getAttribute('data-name') || '');
+                    const kana = normalizeForSearch(item.getAttribute('data-kana') || '');
+                    if (name.includes(normalizedQ) || kana.includes(normalizedQ)) {
+                        item.style.display = '';
+                        visibleCountInGroup++;
+                        visibleSidebarCount++;
+                    } else {
+                        item.style.display = 'none';
+                    }
+                });
+                
+                const content = group.querySelector('.sidebar-group-content');
+                const iconDown = group.querySelector('.chevron-down-icon');
+                const iconRight = group.querySelector('.chevron-right-icon');
+
+                if (normalizedQ) {
+                    group.style.display = visibleCountInGroup > 0 ? '' : 'none';
+                    if (content) {
+                        content.classList.remove('hidden');
+                        content.classList.add('block');
+                    }
+                    if (iconDown && iconRight) {
+                        iconDown.classList.remove('hidden');
+                        iconDown.classList.add('block');
+                        iconRight.classList.remove('block');
+                        iconRight.classList.add('hidden');
+                    }
+                } else {
+                    group.style.display = '';
+                    const office = group.getAttribute('data-office');
+                    const isExpanded = state.expandedGroups[office] !== false; 
+                    if (content) {
+                        if (isExpanded) {
+                            content.classList.remove('hidden');
+                            content.classList.add('block');
+                        } else {
+                            content.classList.remove('block');
+                            content.classList.add('hidden');
+                        }
+                    }
+                    if (iconDown && iconRight) {
+                        if (isExpanded) {
+                            iconDown.classList.remove('hidden');
+                            iconDown.classList.add('block');
+                            iconRight.classList.remove('block');
+                            iconRight.classList.add('hidden');
+                        } else {
+                            iconDown.classList.remove('block');
+                            iconDown.classList.add('hidden');
+                            iconRight.classList.remove('hidden');
+                            iconRight.classList.add('block');
+                        }
+                    }
+                }
+            });
+
+            const noResultEl = document.getElementById('sidebar-no-result');
+            if (noResultEl) {
+                noResultEl.style.display = visibleSidebarCount === 0 && normalizedQ !== '' ? 'block' : 'none';
+            }
+
+            const dashboardItems = document.querySelectorAll('.dashboard-user-row');
+            dashboardItems.forEach(item => {
+                const name = normalizeForSearch(item.getAttribute('data-name') || '');
+                const kana = normalizeForSearch(item.getAttribute('data-kana') || '');
+                if (name.includes(normalizedQ) || kana.includes(normalizedQ)) {
+                    item.style.display = '';
+                } else {
+                    item.style.display = 'none';
+                }
+            });
+        };
+
+        window.handleSearchInput = (q) => {
+            state.searchQuery = q; 
+            window.applySearchFilter(q);
+        };
+
+        window.toggleGroup = (office) => {
+            const isCurrentlyExpanded = state.expandedGroups[office] !== false;
+            const newExpandedState = !isCurrentlyExpanded;
+            
+            setState({
+                expandedGroups: {
+                    ...state.expandedGroups,
+                    [office]: newExpandedState
+                }
+            });
+
+            const q = state.searchQuery;
+            if (q) return; 
+
+            const groups = document.querySelectorAll('.sidebar-group');
+            groups.forEach(group => {
+                if (group.getAttribute('data-office') === office) {
+                    const content = group.querySelector('.sidebar-group-content');
+                    const iconDown = group.querySelector('.chevron-down-icon');
+                    const iconRight = group.querySelector('.chevron-right-icon');
+
+                    if (content) {
+                        if (newExpandedState) {
+                            content.classList.remove('hidden');
+                            content.classList.add('block');
+                        } else {
+                            content.classList.remove('block');
+                            content.classList.add('hidden');
+                        }
+                    }
+                    if (iconDown && iconRight) {
+                        if (newExpandedState) {
+                            iconDown.classList.remove('hidden');
+                            iconDown.classList.add('block');
+                            iconRight.classList.remove('block');
+                            iconRight.classList.add('hidden');
+                        } else {
+                            iconDown.classList.remove('block');
+                            iconDown.classList.add('hidden');
+                            iconRight.classList.remove('hidden');
+                            iconRight.classList.add('block');
+                        }
+                    }
+                }
+            });
+        };
+
+        window.setView = (view) => setState({ view });
+        
+        window.setSelectedOffice = (office) => {
+            setState({ 
+                selectedOffice: office,
+                view: 'dashboard',
+                selectedUserId: null
+            });
+        };
+
+        window.setStatusFilter = (f) => setState({ statusFilter: f }); 
+        
+        window.setAlertFilter = (f) => setState({ alertFilter: f }); 
+
+        window.setSelectedUserId = (uid) => setState({ selectedUserId: uid, view: 'user-detail' });
+        
+        window.setGraphPeriod = (p) => { 
+            if (p === 'custom') {
+                const u = processedData.userStatsMap[state.selectedUserId];
+                if (u && u.allRecords.length > 0) {
+                    const records = u.allRecords;
+                    const latestDateStr = records[records.length - 1].date.replace(/-/g, '/');
+                    const latestDate = new Date(latestDateStr);
+                    
+                    const toYMD = (d) => {
+                        const y = d.getFullYear();
+                        const m = String(d.getMonth() + 1).padStart(2, '0');
+                        const day = String(d.getDate()).padStart(2, '0');
+                        return `${y}-${m}-${day}`;
+                    };
+
+                    if (!state.customEndDate) {
+                        state.customEndDate = toYMD(latestDate);
+                    }
+                    if (!state.customStartDate) {
+                        const d = new Date(latestDate);
+                        d.setMonth(d.getMonth() - 1);
+                        state.customStartDate = toYMD(d);
+                    }
+                } else {
+                    const toYMD = (d) => {
+                        const y = d.getFullYear();
+                        const m = String(d.getMonth() + 1).padStart(2, '0');
+                        const day = String(d.getDate()).padStart(2, '0');
+                        return `${y}-${m}-${day}`;
+                    };
+                    if (!state.customEndDate) state.customEndDate = toYMD(new Date());
+                    if (!state.customStartDate) {
+                        const d = new Date();
+                        d.setMonth(d.getMonth() - 1);
+                        state.customStartDate = toYMD(d);
+                    }
+                }
+            }
+            setState({ graphPeriod: p }); 
+        };
+
+        window.setCustomDate = (type, val) => {
+            if (type === 'start') {
+                setState({ customStartDate: val });
+            } else if (type === 'end') {
+                setState({ customEndDate: val });
+            }
+        };
+
+        window.showDashboard = () => {
+            const searchInput = document.getElementById('searchInput');
+            if(searchInput) searchInput.value = '';
+            setState({ selectedUserId: null, view: 'dashboard', searchQuery: '' });
+        };
+
+        window.openAlertHistory = (uid, event) => {
+            if (event) event.stopPropagation();
+            setState({ alertModalUid: uid, alertModalMode: 'alertOnly' });
+        };
+        window.closeAlertHistory = () => {
+            setState({ alertModalUid: null });
+        };
+        window.setAlertModalMode = (mode) => {
+            setState({ alertModalMode: mode });
+        };
+
+        window.openCSVModal = (target) => {
+            const months = new Set();
+            let userName = '';
+
+            if (target === 'all') {
+                processedData.userList.forEach(u => {
+                    u.allRecords.forEach(r => {
+                        const m = (r.date || '').match(/^(\d{4})[-/](\d{1,2})/);
+                        if (m) months.add(`${m[1]}/${m[2].padStart(2, '0')}`);
+                    });
+                });
+            } else {
+                const u = processedData.userStatsMap[target];
+                if (!u) return;
+                userName = u.name;
+                u.allRecords.forEach(r => {
+                    const m = (r.date || '').match(/^(\d{4})[-/](\d{1,2})/);
+                    if (m) months.add(`${m[1]}/${m[2].padStart(2, '0')}`);
+                });
+            }
+
+            const monthArray = Array.from(months).sort().reverse();
+            setState({ csvExportModal: { type: target, availableMonths: monthArray, userName } });
+        };
+
+        window.closeCSVModal = () => {
+            setState({ csvExportModal: null });
+        };
+
+        window.toggleSidebar = () => {
+            setState({ isSidebarOpen: !state.isSidebarOpen });
+            
+            const sidebar = document.getElementById('main-sidebar');
+            if (sidebar) {
+                if (state.isSidebarOpen) {
+                    sidebar.className = "transition-all duration-300 ease-in-out bg-white flex flex-col h-[calc(100vh-53px)] sticky top-[53px] flex-shrink-0 border-r border-slate-200 z-40 w-64 opacity-100";
+                } else {
+                    sidebar.className = "transition-all duration-300 ease-in-out bg-slate-50 flex flex-col h-[calc(100vh-53px)] sticky top-[53px] flex-shrink-0 w-0 opacity-0 overflow-hidden border-r-0 z-40";
+                }
+            }
+            setTimeout(() => {
+                window.dispatchEvent(new Event('resize'));
+            }, 300);
+        };
+
+        window.executeCSVExport = () => {
+            const checkboxes = document.querySelectorAll('.csv-month-checkbox:checked');
+            const selectedVals = Array.from(checkboxes).map(cb => cb.value);
+            
+            if (selectedVals.length === 0) {
+                alert("出力する月を選んでチョ！");
+                return;
+            }
+
+            const isAllSelected = selectedVals.includes('all');
+            const { type } = state.csvExportModal;
+            const nowStr = new Date().toISOString().slice(0,10).replace(/-/g, '');
+
+            const items = ['sysBP', 'diaBP', 'pulse', 'spo2', 'temp', 'bmi', 'weight', 'bloodSugar', 'respRate', 'sleepTime', 'waterIntake', 'walkTime5m'];
+            const itemNames = ['血圧(収)', '血圧(拡)', '脈拍', 'SpO2', '体温', 'BMI', '体重', '血糖値', '呼吸数', '睡眠時間', '水分量', '5m歩行'];
+            const catItems = ['turgor', 'anorexia', 'medRecord', 'backPain', 'urinationPain', 'angina', 'oralEnv', 'fallHistory'];
+
+            const wb = XLSX.utils.book_new();
+
+            const applyFontToSheet = (ws) => {
+                if (!ws['!ref']) return;
+                const range = XLSX.utils.decode_range(ws['!ref']);
+                for (let R = range.s.r; R <= range.e.r; ++R) {
+                    for (let C = range.s.c; C <= range.e.c; ++C) {
+                        const cellRef = XLSX.utils.encode_cell({c: C, r: R});
+                        if (!ws[cellRef]) continue;
+                        ws[cellRef].s = {
+                            font: { name: '游ゴシック' }
+                        };
+                    }
+                }
+            };
+
+            if (type === 'all') {
+                const latestHeader = ["店舗名", "利用者名", "フリガナ", "ステータス", "最新アラート(直近1ヶ月)"];
+                items.forEach(k => {
+                    latestHeader.push(`${itemNames[items.indexOf(k)]}[最新]`, `${itemNames[items.indexOf(k)]}[平均]`, `★${itemNames[items.indexOf(k)]}[変動]`);
+                });
+                const latestData = [latestHeader];
+
+                processedData.userList.forEach(u => {
+                    let row = [u.officeName || '', u.name || '', u.kanaName || '', u.isDiscontinued ? '停止' : '継続中'];
+                    const alertStatus = checkAlertStatus(u);
+                    row.push(alertStatus.hasRed ? '警報あり' : '-');
+
+                    items.forEach(k => {
+                        const isTemp = k === 'temp';
+                        const isSleep = k === 'sleepTime';
+                        const latestValid = [...u.allRecords].reverse().find(r => isValidVital(k, r[k]));
+                        const avg = u.overallAverages[k];
+                        const now = latestValid ? parseFloat(latestValid[k]) : null;
+                        const dev = latestValid?.deviations?.[k];
+
+                        row.push(
+                            now !== null && !isNaN(now) ? (isSleep ? formatSleepTime(now) : Number(now.toFixed(isTemp ? 1 : 0))) : '-',
+                            avg ? (isSleep ? formatSleepTime(avg) : Number((isTemp ? avg.toFixed(1) : Math.floor(avg)))) : '-',
+                            dev !== undefined && dev !== null ? (isSleep ? formatDevForCSV(dev, isTemp, true) : Number(dev.toFixed(isTemp ? 1 : 0))) : '-'
+                        );
+                    });
+                    latestData.push(row);
+                });
+                const wsLatest = XLSX.utils.aoa_to_sheet(latestData);
+                applyFontToSheet(wsLatest);
+                XLSX.utils.book_append_sheet(wb, wsLatest, "最新一覧");
+
+                const historyHeader = ["店舗名", "利用者名", "フリガナ", "ステータス", "測定日時", "アラート内容"];
+                items.forEach(k => {
+                    historyHeader.push(`${itemNames[items.indexOf(k)]}[測定値]`, `${itemNames[items.indexOf(k)]}[平均]`, `★${itemNames[items.indexOf(k)]}[変動]`);
+                });
+                catItems.forEach(k => {
+                    historyHeader.push(catLabelsTitle[k]);
+                });
+                const historyData = [historyHeader];
+
+                processedData.userList.forEach(u => {
+                    const targetRecords = u.allRecords.filter(r => {
+                        if (isAllSelected) return true;
+                        const m = (r.date || '').match(/^(\d{4})[-/](\d{1,2})/);
+                        if (m) {
+                            return selectedVals.includes(`${m[1]}/${m[2].padStart(2, '0')}`);
+                        }
+                        return false;
+                    });
+
+                    targetRecords.forEach(r => {
+                        let row = [u.officeName || '', u.name || '', u.kanaName || '', u.isDiscontinued ? '停止' : '継続中', r.date || '', r.alertMsg || '-'];
+                        
+                        items.forEach(k => {
+                            const isTemp = k === 'temp';
+                            const isSleep = k === 'sleepTime';
+                            const val = r[k] !== undefined && r[k] !== null && r[k] !== '' ? parseFloat(r[k]) : null;
+                            const avg = u.overallAverages[k];
+                            const dev = r.deviations?.[k];
+
+                            row.push(
+                                val !== null && !isNaN(val) ? (isSleep ? formatSleepTime(val) : Number(val.toFixed(isTemp ? 1 : 0))) : '-',
+                                avg ? (isSleep ? formatSleepTime(avg) : Number((isTemp ? avg.toFixed(1) : Math.floor(avg)))) : '-',
+                                dev !== undefined && dev !== null ? (isSleep ? formatDevForCSV(dev, isTemp, true) : Number(dev.toFixed(isTemp ? 1 : 0))) : '-'
+                            );
+                        });
+
+                        catItems.forEach(k => {
+                            const val = r[k] !== undefined && r[k] !== null && r[k] !== '' ? parseFloat(r[k]) : null;
+                            const label = val !== null ? catLabels[k][val] || val : '-';
+                            row.push(label);
+                        });
+                        historyData.push(row);
+                    });
+                });
+                const wsHistory = XLSX.utils.aoa_to_sheet(historyData);
+                applyFontToSheet(wsHistory);
+                XLSX.utils.book_append_sheet(wb, wsHistory, "履歴一覧");
+
+                XLSX.writeFile(wb, `入院予兆分析_全体データ_${nowStr}.xlsx`);
+
+            } else {
+                const u = processedData.userStatsMap[type];
+                if (!u) return;
+
+                const historyHeader = ["店舗名", "利用者名", "フリガナ", "ステータス", "測定日時", "アラート内容"];
+                items.forEach(k => {
+                    historyHeader.push(`${itemNames[items.indexOf(k)]}[測定値]`, `${itemNames[items.indexOf(k)]}[平均]`, `★${itemNames[items.indexOf(k)]}[変動]`);
+                });
+                catItems.forEach(k => {
+                    historyHeader.push(catLabelsTitle[k]);
+                });
+                const historyData = [historyHeader];
+
+                const targetRecords = u.allRecords.filter(r => {
+                    if (isAllSelected) return true;
+                    const m = (r.date || '').match(/^(\d{4})[-/](\d{1,2})/);
+                    if (m) {
+                        return selectedVals.includes(`${m[1]}/${m[2].padStart(2, '0')}`);
+                    }
+                    return false;
+                });
+
+                targetRecords.forEach(r => {
+                    let row = [u.officeName || '', u.name || '', u.kanaName || '', u.isDiscontinued ? '停止' : '継続中', r.date || '', r.alertMsg || '-'];
+                    
+                    items.forEach(k => {
+                        const isTemp = k === 'temp';
+                        const isSleep = k === 'sleepTime';
+                        const val = r[k] !== undefined && r[k] !== null && r[k] !== '' ? parseFloat(r[k]) : null;
+                        const avg = u.overallAverages[k];
+                        const dev = r.deviations?.[k];
+
+                        row.push(
+                            val !== null && !isNaN(val) ? (isSleep ? formatSleepTime(val) : Number(val.toFixed(isTemp ? 1 : 0))) : '-',
+                            avg ? (isSleep ? formatSleepTime(avg) : Number((isTemp ? avg.toFixed(1) : Math.floor(avg)))) : '-',
+                            dev !== undefined && dev !== null ? (isSleep ? formatDevForCSV(dev, isTemp, true) : Number(dev.toFixed(isTemp ? 1 : 0))) : '-'
+                        );
+                    });
+
+                    catItems.forEach(k => {
+                        const val = r[k] !== undefined && r[k] !== null && r[k] !== '' ? parseFloat(r[k]) : null;
+                        const label = val !== null ? catLabels[k][val] || val : '-';
+                        row.push(label);
+                    });
+                    historyData.push(row);
+                });
+
+                const wsHistory = XLSX.utils.aoa_to_sheet(historyData);
+                applyFontToSheet(wsHistory);
+                XLSX.utils.book_append_sheet(wb, wsHistory, `${u.name}_履歴`);
+
+                XLSX.writeFile(wb, `入院予兆分析_個人データ_${u.name}_${nowStr}.xlsx`);
+            }
+
+            window.closeCSVModal();
+        };
+
+        window.exportBackup = async () => {
+            const h = await DB.getAllHistory(); const s = await DB.getStatusMap();
+            const b = { version: "1.0", history: h, status: s };
+            const blob = new Blob([JSON.stringify(b)], { type: 'application/json' });
+            const a = document.createElement('a'); a.href = URL.createObjectURL(blob);
+            a.download = `入院予兆分析PRO_BK_${new Date().toISOString().split('T')[0]}.json`; a.click();
+        };
+
+        window.importBackup = async (event) => {
+            const file = event.target.files[0];
+            if (!file) return;
+            try {
+                const text = await file.text();
+                const data = JSON.parse(text);
+                setState({ loading: true });
+                if (data.history) for (const h of data.history) await DB.saveHistory(h);
+                if (data.status) for (const uid in data.status) await DB.updateStatus(data.status[uid]);
+                await initApp();
+                setState({ uploadSuccessMessage: "バックアップ復元完了！" });
+                setTimeout(() => setState({ uploadSuccessMessage: '' }), 5000);
+            } catch (e) {
+                alert("読込失敗！ファイルの形式合ってるか確認してチョ！");
+            }
+            event.target.value = '';
+        };
+
+        function generateStatusEditHTML(u) {
+            return `
+            <label class="flex items-center gap-2 p-2 bg-slate-50 rounded-lg border border-slate-200 cursor-pointer hover:bg-slate-100 transition-colors">
+                <input id="discontinue-checkbox-${u.uid}" type="checkbox" class="w-4 h-4 rounded text-blue-600 focus:ring-blue-500" ${u.isDiscontinued ? 'checked' : ''} onchange="window.updateManualStatus('${escapeHtml(u.uid)}', { isDiscontinued: this.checked })" />
+                <span class="font-bold text-slate-700 text-xs">利用停止</span>
+            </label>
+            ${u.isDiscontinued ? `
+            <div class="mt-3 space-y-2 p-3 bg-slate-50 border border-slate-200 rounded-lg animate-in fade-in">
+                <div>
+                    <label class="block text-[10px] font-bold text-slate-500 mb-1">停止日</label>
+                    <input id="discontinue-date-${u.uid}" type="date" class="w-full border border-slate-300 rounded px-2 py-1 text-xs outline-none focus:ring-2 focus:ring-blue-500" value="${escapeHtml(u.discontinueDate || '')}" onchange="window.updateManualStatus('${escapeHtml(u.uid)}', { discontinueDate: this.value })" />
+                </div>
+                <div>
+                    <label class="block text-[10px] font-bold text-slate-500 mb-1">停止理由</label>
+                    <input id="discontinue-reason-${u.uid}" type="text" class="w-full border border-slate-300 rounded px-2 py-1 text-xs outline-none focus:ring-2 focus:ring-blue-500" placeholder="理由を入力..." value="${escapeHtml(u.discontinueReason || '')}" onchange="window.updateManualStatus('${escapeHtml(u.uid)}', { discontinueReason: this.value })" />
+                </div>
+                <div>
+                    <label class="block text-[10px] font-bold text-slate-500 mb-1">備考</label>
+                    <textarea id="discontinue-note-${u.uid}" class="w-full border border-slate-300 rounded px-2 py-1 text-xs outline-none focus:ring-2 focus:ring-blue-500 h-12" placeholder="備考を入力..." onchange="window.updateManualStatus('${escapeHtml(u.uid)}', { discontinueNote: this.value })">${escapeHtml(u.discontinueNote || '')}</textarea>
+                </div>
+            </div>` : ''}
+            `;
+        }
+
+        window.updateManualStatus = async (uid, updates) => {
+            const status = { ...state.manualStatus[uid], uid, ...updates };
+            await DB.updateStatus(status);
+            const newMap = await DB.getStatusMap();
+            state.manualStatus = newMap;
+            
+            processDataForView();
+            
+            const u = processedData.userStatsMap[uid];
+            if (!u) return;
+
+            const editContainer = document.getElementById('status-edit-container');
+            if (editContainer) {
+                const activeId = document.activeElement ? document.activeElement.id : null;
+                const selectionStart = document.activeElement && document.activeElement.selectionStart ? document.activeElement.selectionStart : null;
+                const selectionEnd = document.activeElement && document.activeElement.selectionEnd ? document.activeElement.selectionEnd : null;
+
+                editContainer.innerHTML = generateStatusEditHTML(u);
+
+                if (activeId) {
+                    const el = document.getElementById(activeId);
+                    if (el) {
+                        el.focus();
+                        try { el.setSelectionRange(selectionStart, selectionEnd); } catch(e){}
+                    }
+                }
+            }
+
+            const colorBar = document.getElementById('detail-color-bar');
+            if (colorBar) {
+                colorBar.className = `absolute top-0 left-0 w-full h-1.5 ${u.isDiscontinued ? 'bg-red-500' : 'bg-green-500'}`;
+            }
+
+            const dashboardStatusCell = document.getElementById(`dashboard-status-${uid}`);
+            if (dashboardStatusCell) {
+                dashboardStatusCell.innerHTML = u.isDiscontinued ? `<div class="text-red-500 text-[9px] font-bold truncate">停止: ${escapeHtml(u.discontinueReason || u.discontinueNote || '理由なし')}</div>` : `<span class="text-green-500 text-[9px] font-bold">継続中</span>`;
+            }
+        };
+
+        window.handleMultipleFileUpload = async (event) => {
+            const files = Array.from(event.target.files);
+            if (!files || files.length === 0) return;
+            setState({ uploadStatus: { isUploading: true, message: `爆速で分析中...` } });
+            
+            try {
+                let successCount = 0;
+
+                for (const f of files) {
+                    if (!f.name.endsWith('.csv')) continue;
+                    
+                    const buffer = await f.arrayBuffer();
+                    
+                    let text = new TextDecoder('utf-8').decode(buffer);
+                    text = text.replace(/^\uFEFF/, ''); 
+                    
+                    const testKeywords = ["事業所", "拠点", "施設", "利用者", "氏名", "名前", "血圧", "脈拍", "判定", "測定", "日付", "記録", "生年月日"];
+                    const isUtf8Valid = testKeywords.some(kw => text.includes(kw));
+
+                    if (!isUtf8Valid) {
+                        text = new TextDecoder('shift-jis').decode(buffer);
+                    }
+
+                    const lines = text.split('\n').filter(l => l.trim().length > 0);
+                    if (lines.length < 2) continue;
+
+                    const headers = parseCSVRow(lines[0]);
+                    
+                    const usedIndexes = new Set();
+                    
+                    // 【神アプデ】完全一致を優先して探す、絶対に誤爆しない最強AI辞書エンジン！
+                    const findIdx = (keywords) => {
+                        for (const kw of keywords) {
+                            const idx = headers.findIndex((h, i) => {
+                                if (!h || usedIndexes.has(i)) return false;
+                                const normalized = h.replace(/[\s　"'\r\n]/g, '');
+                                return normalized === kw;
+                            });
+                            if (idx !== -1) {
+                                usedIndexes.add(idx);
+                                return idx;
+                            }
+                        }
+                        for (const kw of keywords) {
+                            const idx = headers.findIndex((h, i) => {
+                                if (!h || usedIndexes.has(i)) return false;
+                                const normalized = h.replace(/[\s　"'\r\n]/g, '');
+                                return normalized.includes(kw);
+                            });
+                            if (idx !== -1) {
+                                usedIndexes.add(idx);
+                                return idx;
+                            }
+                        }
+                        return -1;
+                    };
+
+                    // 【神アプデ】アラートの「ステータス」と利用停止の「ステータス」の誤爆を防ぐため、後ろから探す専用エンジン！
+                    const findLastIdx = (keywords) => {
+                        for (const kw of keywords) {
+                            let lastIdx = -1;
+                            for (let i = headers.length - 1; i >= 0; i--) {
+                                if (headers[i] && !usedIndexes.has(i) && headers[i].replace(/[\s　"'\r\n]/g, '') === kw) {
+                                    lastIdx = i;
+                                    break;
+                                }
+                            }
+                            if (lastIdx !== -1) {
+                                usedIndexes.add(lastIdx);
+                                return lastIdx;
+                            }
+                        }
+                        for (const kw of keywords) {
+                            let lastIdx = -1;
+                            for (let i = headers.length - 1; i >= 0; i--) {
+                                if (headers[i] && !usedIndexes.has(i) && headers[i].replace(/[\s　"'\r\n]/g, '').includes(kw)) {
+                                    lastIdx = i;
+                                    break;
+                                }
+                            }
+                            if (lastIdx !== -1) {
+                                usedIndexes.add(lastIdx);
+                                return lastIdx;
+                            }
+                        }
+                        return -1;
+                    };
+
+                    const mapIdx = { 
+                        officeName: findIdx(["事業所名", "事業所", "拠点名", "拠点", "施設名", "施設", "店舗名", "店舗", "所属"]), 
+                        date: findIdx(["判定日時", "測定日時", "日付", "記録日時"]), 
+                        sysBP: findIdx(["血圧(収縮期)", "血圧（収縮期）", "最高血圧", "収縮期血圧", "収縮期"]), 
+                        diaBP: findIdx(["血圧(拡張期)", "血圧（拡張期）", "最低血圧", "拡張期血圧", "拡張期"]), 
+                        pulse: findIdx(["脈拍", "心拍"]), 
+                        spo2: findIdx(["SpO2", "SPO2", "酸素飽和度"]), 
+                        temp: findIdx(["体温"]),
+                        bmi: findIdx(["BMI", "ＢＭＩ", "bmi"]),
+                        weight: findIdx(["体重"]),
+                        bloodSugar: findIdx(["血糖", "血糖値"]),
+                        respRate: findIdx(["呼吸", "呼吸数"]),
+                        turgor: findIdx(["脱水_スコア", "ツルゴール_スコア", "皮膚ツルゴール_スコア", "脱水", "ツルゴール", "皮膚ツルゴール"]),
+                        anorexia: findIdx(["食欲不振_スコア", "食欲低下_スコア", "食欲不振", "食欲低下"]),
+                        medRecord: findIdx(["服薬数_スコア", "服薬記録_スコア", "服薬状況_スコア", "服薬数(種)_スコア", "服薬数(種)", "服薬記録", "服薬状況", "服薬", "服薬数"]), 
+                        backPain: findIdx(["背部痛_スコア", "腰痛_スコア", "背部痛", "腰痛"]),
+                        urinationPain: findIdx(["排尿時痛_スコア", "排尿痛_スコア", "排尿時痛", "排尿痛"]),
+                        angina: findIdx(["胸痛_スコア", "狭心痛_スコア", "狭心症_スコア", "胸痛", "狭心痛", "狭心症"]), 
+                        oralEnv: findIdx(["口腔状態_スコア", "口腔環境_スコア", "口腔ケア_スコア", "口腔状態", "口腔環境", "口腔ケア", "口腔", "歯"]),
+                        alertMsg: findIdx(["アラート", "警報", "警告", "EWS", "リスク", "スコア", "判定結果"]), 
+                        disease: findIdx(["疾患名", "疾患内容", "疾患", "アラート内容", "病名", "疾患アラート"]), 
+                        sleepTime: findIdx(["睡眠", "睡眠時間", "睡眠時間(分)"]),
+                        waterIntake: findIdx(["水分", "水分量", "飲水", "水分量(mL)"]),
+                        walkTime5m: findIdx(["5m歩行", "歩行時間", "5m", "5m歩行(秒)"]),
+                        fallHistory: findIdx(["転倒歴_スコア", "転倒歴(月)_スコア", "転倒歴", "転倒歴(月)", "転倒有無", "転倒の有無", "直近の転倒", "過去の転倒"]), 
+                        lastName: findIdx(["利用者名(姓)", "利用者名（姓）", "姓"]), 
+                        firstName: findIdx(["利用者名(名)", "利用者名（名）", "名"]), 
+                        kanaLast: findIdx(["利用者名カナ(姓)", "利用者名カナ（姓）", "カナ(姓)", "カナ（姓）", "カナ姓", "ふりがな(姓)"]), 
+                        kanaFirst: findIdx(["利用者名カナ(名)", "利用者名カナ（名）", "カナ(名)", "カナ（名）", "カナ名", "ふりがな(名)"]), 
+                        birthDate: findIdx(["生年月日", "誕生日"])
+                    };
+                    
+                    const fullNameIdx = (mapIdx.lastName === -1 && mapIdx.firstName === -1) ? findIdx(["利用者名", "利用者氏名", "氏名", "名前", "お名前"]) : -1;
+                    const kanaFullNameIdx = (mapIdx.kanaLast === -1 && mapIdx.kanaFirst === -1) ? findIdx(["利用者名カナ", "利用者カナ", "カナ", "ふりがな"]) : -1;
+                    
+                    // 【神アプデ】文字のデータを数値に変換するAI辞書！数字がないデータでも完璧に拾い上げるぜ！
+                    const parseCategoryValue = (item, val) => {
+                        if (val === null || val === undefined || val === '') return null;
+                        
+                        let strVal = String(val).replace(/[！-～]/g, function(s) {
+                            return String.fromCharCode(s.charCodeAt(0) - 0xFEE0);
+                        }).replace(/["']/g, '').trim();
+                        
+                        if (/^\d+(\.\d+)?$/.test(strVal)) {
+                            const n = Math.floor(parseFloat(strVal));
+                            if ([10, 20, 30].includes(n)) return n;
+                            if (n === 0) return 10;
+                            if (n === 1) return 20;
+                            if (n === 2) return 30;
+                            if (n === 3) return 30;
+                            if (n > 3) return 30;
+                        }
+                        
+                        strVal = strVal.replace(/[\s　]/g, '');
+
+                        const mappings = {
+                            turgor: [{k: '3秒以上', v: 20}, {k: '遅延なし', v: 10}],
+                            anorexia: [{k: '明らか', v: 30}, {k: 'わずか', v: 20}, {k: '減少無し', v: 10}, {k: '減少なし', v: 10}],
+                            medRecord: [{k: '問題あり', v: 30}, {k: 'やや', v: 20}, {k: '問題なし', v: 10}],
+                            backPain: [{k: '重度', v: 30}, {k: '軽度', v: 20}, {k: 'なし', v: 10}],
+                            urinationPain: [{k: 'あり', v: 20}, {k: 'なし', v: 10}],
+                            angina: [{k: '頻繁', v: 30}, {k: '重度', v: 30}, {k: '軽度', v: 20}, {k: '不定期', v: 20}, {k: '狭心', v: 20}, {k: '胸痛', v: 20}, {k: 'なし', v: 10}],
+                            oralEnv: [{k: '重度', v: 30}, {k: '歯周病', v: 30}, {k: '軽度', v: 20}, {k: '歯肉炎', v: 20}, {k: '問題なし', v: 10}],
+                            fallHistory: [{k: 'あり', v: 20}, {k: '転倒', v: 20}, {k: 'なし', v: 10}]
+                        };
+
+                        if (mappings[item]) {
+                            for (const map of mappings[item]) {
+                                if (strVal.includes(map.k)) return map.v;
+                            }
+                        }
+                        return null;
+                    };
+
+                    const fileRecords = lines.slice(1).map(l => {
+                        const c = parseCSVRow(l);
+                        if (c.length < 3) return null; 
+                        
+                        let lName = '', fName = '', kLast = '', kFirst = '';
+                        
+                        if (fullNameIdx !== -1) {
+                            lName = c[fullNameIdx] || '';
+                        } else {
+                            if (mapIdx.lastName !== -1) lName = c[mapIdx.lastName] || '';
+                            if (mapIdx.firstName !== -1) fName = c[mapIdx.firstName] || '';
+                        }
+                        
+                        if (kanaFullNameIdx !== -1) {
+                            kLast = c[kanaFullNameIdx] || '';
+                        } else {
+                            if (mapIdx.kanaLast !== -1) kLast = c[mapIdx.kanaLast] || '';
+                            if (mapIdx.kanaFirst !== -1) kFirst = c[mapIdx.kanaFirst] || '';
+                        }
+
+                        const rawAlert = mapIdx.alertMsg !== -1 ? (c[mapIdx.alertMsg] || '').trim() : '';
+                        const rawDisease = mapIdx.disease !== -1 ? (c[mapIdx.disease] || '').trim() : (c[8] || '').trim();
+                        
+                        let combinedAlert = rawAlert;
+                        if (rawDisease && rawDisease !== '-' && rawDisease !== 'ー') {
+                            if (combinedAlert && combinedAlert !== '-' && combinedAlert !== 'ー') {
+                                combinedAlert = `${combinedAlert} | 疾患内容: ${rawDisease}`;
+                            } else {
+                                combinedAlert = `疾患内容: ${rawDisease}`;
+                            }
+                        }
+
+                        let parsedFallHistory = mapIdx.fallHistory !== -1 ? parseCategoryValue('fallHistory', c[mapIdx.fallHistory]) : null;
+                        if ((parsedFallHistory === null || parsedFallHistory === 10) && combinedAlert.includes('転倒')) {
+                            parsedFallHistory = 20;
+                        }
+                        
+                        let parsedAngina = mapIdx.angina !== -1 ? parseCategoryValue('angina', c[mapIdx.angina]) : null;
+                        if ((parsedAngina === null || parsedAngina === 10) && combinedAlert.includes('狭心')) {
+                            parsedAngina = 30;
+                        }
+                        
+                        // 【神アプデ】アラートの「ステータス」列との誤爆を完全に防ぐため、絶対領域(CSV末尾と固定インデックス)から判定するぜ！
+                        // さらに、ハイフン( - )を退会理由と勘違いしないようにパーフェクトブロック！
+                        let isDiscontinued = false;
+                        let discontinueDate = '';
+                        let discontinueReason = '';
+                        let discontinueNote = '';
+
+                        const checkDiscontinued = (statusVal, dateVal, reasonVal, noteVal) => {
+                            const isInvalid = (v) => !v || v === '-' || v === 'ー' || v === 'null' || v === 'NULL';
+                            
+                            if (statusVal === '無効' || statusVal === '中止' || statusVal === '停止' || statusVal === '利用停止' || statusVal === '退会') {
+                                isDiscontinued = true;
+                                if (!discontinueReason) discontinueReason = 'ステータス: ' + statusVal;
+                            }
+                            if (!isInvalid(dateVal)) {
+                                isDiscontinued = true;
+                                discontinueDate = dateVal;
+                            }
+                            if (!isInvalid(reasonVal)) {
+                                isDiscontinued = true;
+                                discontinueReason = reasonVal;
+                            }
+                            if (!isInvalid(noteVal)) {
+                                discontinueNote = noteVal;
+                            }
+                        };
+
+                        const cLen = c.length;
+                        // ① CSVの最後尾4列をチェック
+                        if (cLen >= 4) {
+                            checkDiscontinued(
+                                c[cLen - 4].replace(/["']/g, '').trim(),
+                                c[cLen - 3].replace(/["']/g, '').trim(),
+                                c[cLen - 2].replace(/["']/g, '').trim(),
+                                c[cLen - 1].replace(/["']/g, '').trim()
+                            );
+                        }
+
+                        // ② 以前の固定列(170~173)も保険でチェック
+                        if (cLen > 173) {
+                            checkDiscontinued(
+                                c[170] ? c[170].replace(/["']/g, '').trim() : '',
+                                c[171] ? c[171].replace(/["']/g, '').trim() : '',
+                                c[172] ? c[172].replace(/["']/g, '').trim() : '',
+                                c[173] ? c[173].replace(/["']/g, '').trim() : ''
+                            );
+                        }
+
+                        return { 
+                            officeName: mapIdx.officeName !== -1 ? (c[mapIdx.officeName] || '').replace(/["']/g, '').trim() : '', 
+                            lastName: lName, 
+                            firstName: fName, 
+                            kanaLast: kLast, 
+                            kanaFirst: kFirst, 
+                            birthDate: mapIdx.birthDate !== -1 ? c[mapIdx.birthDate] : '', 
+                            date: mapIdx.date !== -1 ? c[mapIdx.date] : '', 
+                            sysBP: mapIdx.sysBP !== -1 ? c[mapIdx.sysBP] : null, 
+                            diaBP: mapIdx.diaBP !== -1 ? c[mapIdx.diaBP] : null, 
+                            pulse: mapIdx.pulse !== -1 ? c[mapIdx.pulse] : null, 
+                            spo2: mapIdx.spo2 !== -1 ? c[mapIdx.spo2] : null, 
+                            temp: mapIdx.temp !== -1 ? c[mapIdx.temp] : null,
+                            bmi: mapIdx.bmi !== -1 ? c[mapIdx.bmi] : null,
+                            weight: mapIdx.weight !== -1 ? c[mapIdx.weight] : null,
+                            bloodSugar: mapIdx.bloodSugar !== -1 ? c[mapIdx.bloodSugar] : null,
+                            respRate: mapIdx.respRate !== -1 ? c[mapIdx.respRate] : null,
+                            turgor: mapIdx.turgor !== -1 ? parseCategoryValue('turgor', c[mapIdx.turgor]) : null,
+                            anorexia: mapIdx.anorexia !== -1 ? parseCategoryValue('anorexia', c[mapIdx.anorexia]) : null,
+                            medRecord: mapIdx.medRecord !== -1 ? parseCategoryValue('medRecord', c[mapIdx.medRecord]) : null,
+                            backPain: mapIdx.backPain !== -1 ? parseCategoryValue('backPain', c[mapIdx.backPain]) : null,
+                            urinationPain: mapIdx.urinationPain !== -1 ? parseCategoryValue('urinationPain', c[mapIdx.urinationPain]) : null,
+                            angina: parsedAngina,
+                            oralEnv: mapIdx.oralEnv !== -1 ? parseCategoryValue('oralEnv', c[mapIdx.oralEnv]) : null,
+                            sleepTime: mapIdx.sleepTime !== -1 ? c[mapIdx.sleepTime] : null,
+                            waterIntake: mapIdx.waterIntake !== -1 ? c[mapIdx.waterIntake] : null,
+                            walkTime5m: mapIdx.walkTime5m !== -1 ? c[mapIdx.walkTime5m] : null,
+                            fallHistory: parsedFallHistory,
+                            alertMsg: combinedAlert || null, 
+                            isDiscontinued: isDiscontinued,
+                            discontinueDate: discontinueDate,
+                            discontinueReason: discontinueReason,
+                            discontinueNote: discontinueNote
+                        };
+                    }).filter(Boolean);
+
+                    if (fileRecords.length > 0) {
+                        const stats = generateStats(fileRecords);
+                        
+                        const hId = Date.now().toString() + '_' + Math.random().toString(36).substr(2, 9);
+                        
+                        const h = { 
+                            id: hId, 
+                            createdAt: formatDate(new Date()), 
+                            fileNames: f.name, 
+                            userCount: Object.keys(stats).length, 
+                            recordCount: fileRecords.length, 
+                            userStatsMap: stats 
+                        };
+                        await DB.saveHistory(h);
+                        successCount++;
+                    }
+                }
+
+                if (successCount > 0) {
+                    const list = await DB.getAllHistory();
+                    setState({ historyList: list, view: 'dashboard', uploadStatus: { isUploading: false, message: '' }, uploadSuccessMessage: `計算完了！ (${successCount}ファイルを保存)` });
+                    setTimeout(() => setState({ uploadSuccessMessage: '' }), 3000);
+                } else { 
+                    setState({ uploadStatus: { isUploading: false, message: '' } }); 
+                    alert("データが見つかんなかったわ。CSVの形式マジ確認してな！");
+                }
+            } catch (e) { 
+                console.error(e);
+                alert("エラー！文字化けかフォーマットの問題かも。マジ萎え〜。"); 
+                setState({ uploadStatus: { isUploading: false, message: '' } }); 
+            }
+            event.target.value = '';
+        };
+
+        window.toggleHistorySelection = (event, id) => {
+            if (event) event.stopPropagation(); 
+            
+            const current = state.selectedHistoryIds;
+            const newSelected = current.includes(id) 
+                ? current.filter(i => i !== id) 
+                : [...current, id];
+            
+            state.selectedHistoryIds = newSelected;
+            
+            const checkbox = document.getElementById(`history-checkbox-${id}`);
+            if(checkbox) checkbox.checked = newSelected.includes(id);
+            
+            const allSelected = state.historyList.length > 0 && newSelected.length === state.historyList.length;
+            const allCb = document.getElementById('history-all-checkbox');
+            if (allCb) allCb.checked = allSelected;
+            
+            const countEl = document.getElementById('history-selected-count');
+            if(countEl) countEl.innerText = newSelected.length;
+            
+            const btn = document.getElementById('history-delete-btn');
+            if (btn) btn.disabled = newSelected.length === 0;
+
+            const row = document.getElementById(`history-row-${id}`);
+            if (row) {
+                if (newSelected.includes(id)) {
+                    row.classList.add('bg-blue-50');
+                } else {
+                    row.classList.remove('bg-blue-50');
+                }
+            }
+        };
+
+        window.toggleHistoryAll = () => {
+            let newSelected = [];
+            if (state.selectedHistoryIds.length === state.historyList.length) {
+                newSelected = []; 
+            } else {
+                newSelected = state.historyList.map(h => h.id); 
+            }
+            state.selectedHistoryIds = newSelected;
+            
+            const allSelected = state.historyList.length > 0 && newSelected.length === state.historyList.length;
+            const allCb = document.getElementById('history-all-checkbox');
+            if (allCb) allCb.checked = allSelected;
+            
+            const countEl = document.getElementById('history-selected-count');
+            if(countEl) countEl.innerText = newSelected.length;
+            
+            state.historyList.forEach(h => {
+                const cb = document.getElementById(`history-checkbox-${h.id}`);
+                if (cb) cb.checked = newSelected.includes(h.id);
+
+                const row = document.getElementById(`history-row-${h.id}`);
+                if (row) {
+                    if (newSelected.includes(h.id)) {
+                        row.classList.add('bg-blue-50');
+                    } else {
+                        row.classList.remove('bg-blue-50');
+                    }
+                }
+            });
+            
+            const btn = document.getElementById('history-delete-btn');
+            if (btn) btn.disabled = newSelected.length === 0;
+        };
+
+        window.requestHistoryDelete = () => {
+            const count = state.selectedHistoryIds.length;
+            if (count === 0) return;
+            setState({
+                confirmModal: {
+                    message: `マジで選択した ${count} 件のデータを削除するけど大丈夫そ？元には戻せねーからな！`,
+                    onConfirm: "executeHistoryDelete()"
+                }
+            });
+        };
+
+        window.executeHistoryDelete = async () => {
+            setState({ confirmModal: null, loading: true });
+            const idsToDelete = state.selectedHistoryIds;
+
+            for (const id of idsToDelete) {
+                await DB.deleteHistory(id);
+            }
+            
+            const newList = await DB.getAllHistory();
+            state.selectedHistoryIds = [];
+            
+            if (newList.length === 0) {
+                await DB.clearAllStatus();
+                localStorage.removeItem('last_active_history_id');
+                setState({ historyList: [], manualStatus: {}, loading: false });
+            } else {
+                setState({ historyList: newList, loading: false });
+            }
+        };
+
+        window.closeModal = () => {
+            setState({ confirmModal: null });
+        };
+
+        function render() {
+            const root = document.getElementById('root');
+            if (state.loading) {
+                root.innerHTML = `<div class="flex items-center justify-center h-screen bg-slate-50"><i data-lucide="activity" class="w-12 h-12 text-blue-500 animate-spin"></i></div>`;
+                lucide.createIcons(); return;
+            }
+
+            const headerHTML = `
+                <header class="bg-white border-b border-slate-200 px-6 py-2.5 flex flex-col md:flex-row md:items-center justify-between sticky top-0 z-50 shadow-sm gap-3">
+                    <div class="flex items-center gap-3">
+                        ${(state.view === 'dashboard' || state.view === 'user-detail') ? `
+                        <button onclick="window.toggleSidebar()" class="p-1.5 text-slate-400 hover:text-slate-600 hover:bg-slate-100 rounded-lg transition-colors" title="サイドバーの開閉">
+                            <i data-lucide="menu" class="w-5 h-5"></i>
+                        </button>
+                        ` : ''}
+                        <div class="bg-gradient-to-br from-blue-600 to-indigo-700 p-1.5 rounded-lg shadow-sm"><i data-lucide="activity" class="w-4 h-4 text-white"></i></div>
+                        <h1 class="text-lg font-bold text-slate-900 leading-none">入院予兆分析 <span class="text-blue-600 font-black">PRO</span></h1>
+                    </div>
+                    <div class="flex flex-col md:flex-row items-center gap-3">
+                        ${(state.view === 'dashboard' || state.view === 'user-detail') ? `
+                            <div class="flex items-center gap-2 bg-slate-50 px-2 py-1 rounded-lg border border-slate-200">
+                                <i data-lucide="building-2" class="w-3.5 h-3.5 text-slate-400"></i>
+                                <select class="bg-transparent text-xs font-bold text-slate-700 outline-none cursor-pointer" onchange="window.setSelectedOffice(this.value)">
+                                    ${processedData.offices.map(o => `<option value="${escapeHtml(o)}" ${state.selectedOffice === o ? 'selected' : ''}>${escapeHtml(o)}</option>`).join('')}
+                                </select>
+                            </div>
+                            <div class="flex items-center gap-2 bg-slate-50 px-2 py-1 rounded-lg border border-slate-200">
+                                <i data-lucide="filter" class="w-3.5 h-3.5 text-slate-400"></i>
+                                <select class="bg-transparent text-xs font-bold text-slate-700 outline-none cursor-pointer" onchange="window.setStatusFilter(this.value)">
+                                    <option value="all" ${state.statusFilter === 'all' ? 'selected' : ''}>全ステータス</option>
+                                    <option value="active" ${state.statusFilter === 'active' ? 'selected' : ''}>継続中のみ</option>
+                                    <option value="discontinued" ${state.statusFilter === 'discontinued' ? 'selected' : ''}>停止のみ</option>
+                                </select>
+                            </div>
+                            <div class="flex items-center gap-2 bg-slate-50 px-2 py-1 rounded-lg border border-slate-200">
+                                <i data-lucide="bell" class="w-3.5 h-3.5 text-slate-400"></i>
+                                <select class="bg-transparent text-xs font-bold text-slate-700 outline-none cursor-pointer" onchange="window.setAlertFilter(this.value)">
+                                    <option value="all" ${state.alertFilter === 'all' ? 'selected' : ''}>全アラート</option>
+                                    <option value="hasAlert" ${state.alertFilter === 'hasAlert' ? 'selected' : ''}>警報あり</option>
+                                    <option value="noAlert" ${state.alertFilter === 'noAlert' ? 'selected' : ''}>警報なし</option>
+                                </select>
+                            </div>
+                        ` : ''}
+                        <nav class="flex gap-1 bg-slate-100 p-1 rounded-lg">
+                            <button onclick="window.setView('history')" class="flex items-center gap-1.5 px-3 py-1 rounded-md text-xs transition-all ${state.view === 'history' ? 'bg-white text-blue-700 font-bold shadow-sm' : 'text-slate-500 hover:text-slate-700 font-medium'}"><i data-lucide="history" class="w-3.5 h-3.5"></i><span>履歴</span></button>
+                            <button onclick="window.showDashboard()" class="flex items-center gap-1.5 px-3 py-1 rounded-md text-xs transition-all ${(state.view === 'dashboard' || state.view === 'user-detail') ? 'bg-white text-blue-700 font-bold shadow-sm' : 'text-slate-500 hover:text-slate-700 font-medium'}"><i data-lucide="users" class="w-3.5 h-3.5"></i><span>利用者</span></button>
+                            <button onclick="window.setView('upload')" class="flex items-center gap-1.5 px-3 py-1 rounded-md text-xs transition-all ${state.view === 'upload' ? 'bg-white text-blue-700 font-bold shadow-sm' : 'text-slate-500 hover:text-slate-700 font-medium'}"><i data-lucide="upload" class="w-3.5 h-3.5"></i><span>読込</span></button>
+                        </nav>
+                    </div>
+                </header>`;
+
+            let content = '';
+            if (state.view === 'history') content = renderHistoryView();
+            else if (state.view === 'upload') content = renderUploadView();
+            else content = renderSplitView();
+
+            let toasts = '';
+            if (state.uploadStatus.isUploading) toasts = `<div class="fixed bottom-6 right-6 bg-blue-600 text-white px-5 py-4 rounded-xl shadow-2xl flex items-center gap-3 z-50 animate-in slide-in-from-bottom-5"><i data-lucide="loader-2" class="w-5 h-5 animate-spin"></i><span class="font-bold text-sm">${state.uploadStatus.message}</span></div>`;
+            else if (state.uploadSuccessMessage) toasts = `<div class="fixed bottom-6 right-6 bg-green-500 text-white px-5 py-4 rounded-xl shadow-2xl flex items-center gap-3 z-50 animate-in slide-in-from-bottom-5 fade-in"><i data-lucide="check-circle-2" class="w-5 h-5"></i><span class="font-bold text-sm">${state.uploadSuccessMessage}</span></div>`;
+
+            let modalHTML = renderModal();
+            let alertModalHTML = renderAlertModal();
+            let csvModalHTML = renderCSVModal(); 
+
+            root.innerHTML = `${toasts}${headerHTML}<main class="flex-1 flex flex-col overflow-hidden">${content}</main>${modalHTML}${alertModalHTML}${csvModalHTML}`;
+            lucide.createIcons();
+            if (state.view === 'user-detail') renderCharts();
+        }
+
+        function renderCSVModal() {
+            if (!state.csvExportModal) return '';
+            const { type, availableMonths, userName } = state.csvExportModal;
+
+            const title = type === 'all' ? '全体データ出力' : '個人データ出力';
+            const subtitle = type === 'all' ? '表示中の全利用者のデータを出力します' : `${escapeHtml(userName)} さん`;
+
+            return `
+            <div class="fixed inset-0 bg-slate-900/50 z-[100] flex items-center justify-center animate-in fade-in p-4 backdrop-blur-sm" onclick="window.closeCSVModal()">
+                <div class="bg-white rounded-3xl shadow-2xl p-8 max-w-sm w-full mx-auto border border-slate-100 flex flex-col max-h-[85vh]" onclick="event.stopPropagation()">
+                    <div class="flex items-center justify-between mb-6">
+                        <div class="flex items-center gap-3">
+                            <div class="w-12 h-12 rounded-full bg-blue-100 flex items-center justify-center flex-shrink-0">
+                                <i data-lucide="file-spreadsheet" class="w-6 h-6 text-blue-600"></i>
+                            </div>
+                            <div>
+                                <h3 class="font-black text-xl text-slate-800">${title}</h3>
+                                <p class="text-xs font-bold text-slate-500">${subtitle}</p>
+                            </div>
+                        </div>
+                        <button onclick="window.closeCSVModal()" class="text-slate-400 hover:text-slate-600 p-2 bg-slate-50 rounded-full transition-colors"><i data-lucide="x" class="w-5 h-5"></i></button>
+                    </div>
+                    
+                    <p class="text-xs font-bold text-slate-500 mb-2">出力する月を選択してね！（複数選択OK）</p>
+                    
+                    <div class="flex-1 overflow-y-auto custom-scrollbar pr-2 space-y-2 mb-6 border border-slate-100 rounded-xl p-3 bg-slate-50">
+                        <label class="flex items-center gap-3 p-2 bg-white rounded-lg border border-slate-200 cursor-pointer hover:bg-blue-50 transition-colors">
+                            <input type="checkbox" class="csv-month-checkbox w-4 h-4 rounded text-blue-600 focus:ring-blue-500" value="all" onchange="const cbs = document.querySelectorAll('.csv-month-checkbox:not([value=\\'all\\'])'); cbs.forEach(cb => cb.checked = this.checked);" />
+                            <span class="font-bold text-slate-700 text-sm">全期間</span>
+                        </label>
+                        ${availableMonths.map(ym => `
+                        <label class="flex items-center gap-3 p-2 bg-white rounded-lg border border-slate-200 cursor-pointer hover:bg-blue-50 transition-colors">
+                            <input type="checkbox" class="csv-month-checkbox w-4 h-4 rounded text-blue-600 focus:ring-blue-500" value="${escapeHtml(ym)}" />
+                            <span class="font-bold text-slate-700 text-sm">${escapeHtml(ym)}</span>
+                        </label>
+                        `).join('')}
+                    </div>
+                    
+                    <div class="flex justify-end gap-3 pt-2 border-t border-slate-100">
+                        <button onclick="window.closeCSVModal()" class="px-5 py-2.5 rounded-xl font-bold text-sm bg-slate-100 text-slate-600 hover:bg-slate-200 transition-colors active:scale-95">キャンセル</button>
+                        <button onclick="window.executeCSVExport()" class="px-5 py-2.5 rounded-xl font-bold text-sm bg-green-600 text-white hover:bg-green-700 transition-colors active:scale-95 shadow-md shadow-green-500/30 flex items-center gap-2">
+                            <i data-lucide="file-spreadsheet" class="w-4 h-4"></i>Excelで出力
+                        </button>
+                    </div>
+                </div>
+            </div>
+            `;
+        }
+
+        function renderModal() {
+            if (!state.confirmModal) return '';
+            return `
+            <div class="fixed inset-0 bg-slate-900/50 z-[100] flex items-center justify-center animate-in fade-in p-4 backdrop-blur-sm">
+                <div class="bg-white rounded-3xl shadow-2xl p-8 max-w-md w-full mx-auto border border-slate-100">
+                    <div class="flex items-center gap-4 mb-4">
+                        <div class="w-12 h-12 rounded-full bg-red-100 flex items-center justify-center flex-shrink-0">
+                            <i data-lucide="alert-triangle" class="w-6 h-6 text-red-600"></i>
+                        </div>
+                        <h3 class="font-black text-2xl text-slate-800">マジ確認！</h3>
+                    </div>
+                    <p class="text-slate-600 mb-8 font-bold">${escapeHtml(state.confirmModal.message)}</p>
+                    <div class="flex justify-end gap-3">
+                        <button onclick="window.closeModal()" class="px-5 py-2.5 rounded-xl font-bold text-sm bg-slate-100 text-slate-600 hover:bg-slate-200 transition-colors active:scale-95">やめとく</button>
+                        <button onclick="window.${state.confirmModal.onConfirm}" class="px-5 py-2.5 rounded-xl font-bold text-sm bg-red-500 text-white hover:bg-red-600 transition-colors active:scale-95 shadow-md shadow-red-500/30">オッケー！</button>
+                    </div>
+                </div>
+            </div>
+            `;
+        }
+
+        function renderAlertModal() {
+            if (!state.alertModalUid) return '';
+            const u = processedData.userStatsMap[state.alertModalUid];
+            if (!u) return '';
+            
+            const uniqueAlerts = [];
+            const seen = new Set();
+            [...u.alerts].sort((a, b) => new Date(b.date) - new Date(a.date)).forEach(a => {
+                const key = a.date + a.message;
+                if (!seen.has(key)) {
+                    seen.add(key);
+                    uniqueAlerts.push(a);
+                }
+            });
+
+            const displayAlerts = uniqueAlerts.filter(a => {
+                if (state.alertModalMode === 'all') return true;
+                
+                const isWarningOrOk = a.message.includes('OK') || a.message.includes('正常') || a.message.includes('注意');
+                const isExplicitAlert = a.message.includes('警報');
+                
+                if (isExplicitAlert) return true;
+                if (isWarningOrOk) return false;
+                
+                return true; 
+            });
+
+            const getAlertStyle = (msg) => {
+                if (msg.includes('OK') || msg.includes('正常')) return { 
+                    bg: 'bg-green-50', hoverBg: 'hover:bg-green-100/50', border: 'border-green-100', text: 'text-green-700', icon: 'check-circle', iconColor: 'text-green-500', labelBg: 'bg-green-100', labelText: 'text-green-600', label: '正常/OK',
+                    diseaseBg: 'bg-green-100', diseaseText: 'text-green-700', diseaseBorder: 'border-green-200', diseaseIcon: 'check'
+                };
+                if (msg.includes('注意')) return { 
+                    bg: 'bg-amber-50', hoverBg: 'hover:bg-amber-100/50', border: 'border-amber-100', text: 'text-amber-700', icon: 'alert-circle', iconColor: 'text-amber-500', labelBg: 'bg-amber-100', labelText: 'text-amber-600', label: '注意',
+                    diseaseBg: 'bg-amber-100', diseaseText: 'text-amber-700', diseaseBorder: 'border-amber-200', diseaseIcon: 'alert-circle'
+                };
+                return { 
+                    bg: 'bg-red-50', hoverBg: 'hover:bg-red-100/50', border: 'border-red-100', text: 'text-red-700', icon: 'alert-triangle', iconColor: 'text-red-500', labelBg: 'bg-red-500', labelText: 'text-white', label: '警報',
+                    diseaseBg: 'bg-red-100', diseaseText: 'text-red-700', diseaseBorder: 'border-red-200', diseaseIcon: 'alert-triangle'
+                };
+            };
+
+            return `
+            <div class="fixed inset-0 bg-slate-900/50 z-[100] flex items-center justify-center animate-in fade-in p-4 backdrop-blur-sm" onclick="window.closeAlertHistory()">
+                <div class="bg-white rounded-3xl shadow-2xl p-6 max-w-xl w-full mx-auto border border-slate-100 flex flex-col max-h-[85vh]" onclick="event.stopPropagation()">
+                    
+                    <div class="flex justify-between items-start mb-4 flex-shrink-0">
+                        <div class="flex items-center gap-3">
+                            <div class="w-12 h-12 rounded-full bg-slate-100 flex items-center justify-center">
+                                <i data-lucide="bell-ring" class="w-6 h-6 text-slate-600"></i>
+                            </div>
+                            <div>
+                                <h3 class="font-black text-xl text-slate-800 flex items-center gap-2">アラート履歴 <span class="text-xs font-bold text-slate-500 bg-slate-100 px-2 py-0.5 rounded-md">${escapeHtml(u.name)}</span></h3>
+                                <p class="text-xs font-bold text-slate-400 mt-0.5">※分析結果に基づくアラート一覧</p>
+                            </div>
+                        </div>
+                        <button onclick="window.closeAlertHistory()" class="text-slate-400 hover:text-slate-600 p-2 bg-slate-50 rounded-full transition-colors"><i data-lucide="x" class="w-5 h-5"></i></button>
+                    </div>
+                    
+                    <div class="flex gap-2 mb-4 bg-slate-50 p-1 rounded-xl flex-shrink-0">
+                        <button onclick="window.setAlertModalMode('alertOnly')" class="flex-1 py-2 text-xs font-black rounded-lg transition-all ${state.alertModalMode === 'alertOnly' ? 'bg-white text-red-600 shadow-sm border border-red-100' : 'text-slate-400 hover:text-slate-600'}">🚨 警報のみ表示</button>
+                        <button onclick="window.setAlertModalMode('all')" class="flex-1 py-2 text-xs font-black rounded-lg transition-all ${state.alertModalMode === 'all' ? 'bg-white text-blue-600 shadow-sm border border-blue-100' : 'text-slate-400 hover:text-slate-600'}">📋 全履歴 (OK/注意含む)</button>
+                    </div>
+                    
+                    <div class="flex-1 overflow-y-auto custom-scrollbar pr-2 pb-2">
+                        <div class="space-y-3">
+                            ${displayAlerts.length > 0 ? displayAlerts.map((a, index) => {
+                                const s = getAlertStyle(a.message);
+                                
+                                const parts = a.message.split(' | 疾患内容: ');
+                                let mainMsg = parts[0];
+                                let diseaseMsg = parts[1] || '';
+                                
+                                if (!diseaseMsg && a.message.startsWith('疾患内容: ')) {
+                                    mainMsg = '';
+                                    diseaseMsg = a.message.replace('疾患内容: ', '');
+                                }
+
+                                if (['警報', '注意', 'OK', '正常', 'アラート', '-'].includes(mainMsg.trim())) {
+                                    mainMsg = ''; 
+                                } else if (mainMsg) {
+                                    mainMsg = `<div class="font-bold text-[13px] ${s.text} leading-relaxed">${escapeHtml(mainMsg)}</div>`;
+                                }
+
+                                const diseaseHtml = diseaseMsg ? `<div class="${mainMsg ? 'mt-2' : 'mt-1'}"><span class="text-[13px] font-black ${s.diseaseText} ${s.diseaseBg} px-2.5 py-1 rounded-md inline-flex items-center gap-1 shadow-sm border ${s.diseaseBorder}"><i data-lucide="${s.diseaseIcon}" class="w-3.5 h-3.5"></i>${escapeHtml(diseaseMsg)}</span></div>` : '';
+                                
+                                if (!mainMsg && !diseaseHtml) {
+                                    mainMsg = `<div class="font-bold text-[13px] ${s.text} leading-relaxed">異常変動を検知しました</div>`;
+                                }
+                                
+                                const alertId = `alert-detail-${index}`;
+                                const record = u.allRecords.find(r => r.date === a.date);
+                                let detailsHtml = '';
+                                
+                                if (record) {
+                                    const numKeys = ['sysBP', 'diaBP', 'pulse', 'spo2', 'temp', 'respRate', 'weight', 'sleepTime', 'waterIntake', 'walkTime5m'];
+                                    const numLabels = { sysBP: '血圧(収)', diaBP: '血圧(拡)', pulse: '脈拍', spo2: 'SpO2', temp: '体温', respRate: '呼吸数', weight: '体重', sleepTime: '睡眠時間', waterIntake: '水分量', walkTime5m: '5m歩行' };
+                                    const numUnits = { sysBP: 'mmHg', diaBP: 'mmHg', pulse: 'bpm', spo2: '%', temp: '℃', respRate: '回/分', weight: 'kg', sleepTime: '', waterIntake: 'ml', walkTime5m: '秒' };
+
+                                    const catKeys = ['turgor', 'anorexia', 'medRecord', 'backPain', 'urinationPain', 'angina', 'oralEnv', 'fallHistory'];
+
+                                    const numDetailsList = numKeys.map(k => {
+                                        let val = getValidVital(k, record[k]);
+                                        let dev = record.deviations?.[k];
+
+                                        if (val === null) {
+                                            const pastRecords = u.allRecords.filter(r => new Date(r.date.replace(/-/g, '/')) <= new Date(record.date.replace(/-/g, '/')));
+                                            const lastValid = [...pastRecords].reverse().find(r => isValidVital(k, r[k]));
+                                            if (lastValid) {
+                                                val = parseFloat(lastValid[k]);
+                                                dev = lastValid.deviations?.[k];
+                                            }
+                                        }
+
+                                        if (val === null) return '';
+
+                                        let valStr = val.toFixed(k==='temp'?1:0);
+                                        let unitStr = numUnits[k] ? `<span class="text-[8px] text-slate-400 font-bold">${numUnits[k]}</span>` : '';
+                                        if (k === 'sleepTime') {
+                                            valStr = formatSleepTime(val);
+                                            unitStr = '';
+                                        }
+
+                                        return `<div class="flex justify-between items-center py-1 border-b border-slate-100/50 last:border-0">
+                                            <span class="text-[10px] text-slate-500 font-bold">${numLabels[k]}</span>
+                                            <div class="flex items-center gap-3">
+                                                <div class="flex items-baseline gap-0.5 w-12 justify-end">
+                                                    <span class="text-xs font-black text-slate-700">${valStr}</span>
+                                                    ${unitStr}
+                                                </div>
+                                                <div class="w-14 flex justify-end">
+                                                    ${formatDev(dev, k === 'temp', k === 'sleepTime')}
+                                                </div>
+                                            </div>
+                                        </div>`;
+                                    }).filter(Boolean).join('');
+
+                                    const catDetailsList = catKeys.map(k => {
+                                        let val = getValidVital(k, record[k]);
+
+                                        if (val === null) {
+                                            const pastRecords = u.allRecords.filter(r => new Date(r.date.replace(/-/g, '/')) <= new Date(record.date.replace(/-/g, '/')));
+                                            const lastValid = [...pastRecords].reverse().find(r => isValidVital(k, r[k]));
+                                            if (lastValid) {
+                                                val = parseFloat(lastValid[k]);
+                                            }
+                                        }
+
+                                        if (k === 'fallHistory' && val === null && a.message.includes('転倒')) {
+                                            val = 20;
+                                        }
+                                        if (k === 'angina' && val === null && a.message.includes('狭心')) {
+                                            val = 30;
+                                        }
+
+                                        if (val === null) return '';
+                                        
+                                        let label = catLabels[k][val] || val;
+                                        if (k === 'medRecord') {
+                                            const texts = {
+                                                10: '服薬数5種類以下・服薬コンプライアンス問題なし',
+                                                20: '服薬数5種類以上または服薬コンプライアンス問題あり',
+                                                30: '服薬数5種類以上・服薬コンプライアンス問題あり'
+                                            }[val];
+                                            if (texts) label = texts;
+                                        }
+                                        
+                                        let statusColor = 'text-slate-400';
+                                        if (val === 30 || (k === 'fallHistory' && val === 20)) statusColor = 'text-red-500 font-black';
+                                        else if (val === 20) statusColor = 'text-amber-500 font-black';
+
+                                        let extraInfo = '';
+                                        if (k === 'fallHistory') {
+                                            const pastRecordsToNow = u.allRecords.filter(r => new Date(r.date.replace(/-/g, '/')) <= new Date(record.date.replace(/-/g, '/')));
+                                            const fallsToNow = pastRecordsToNow.filter(r => isValidVital('fallHistory', r.fallHistory) && parseFloat(r.fallHistory) === 20).reverse();
+                                            if (fallsToNow.length > 0) {
+                                                extraInfo = `<div class="w-full text-right text-[9px] text-slate-500 mt-0.5">最新: ${fallsToNow[0].date.substring(0,10)} (計 ${fallsToNow.length} 回)</div>`;
+                                            } else if (val === 20 && a.message.includes('転倒')) {
+                                                extraInfo = `<div class="w-full text-right text-[9px] text-slate-500 mt-0.5">最新: ${record.date.substring(0,10)} (計 1 回)</div>`;
+                                            }
+                                        }
+
+                                        return `<div class="flex flex-col py-1 border-b border-slate-100/50 last:border-0">
+                                            <div class="flex justify-between items-center">
+                                                <span class="text-[10px] text-slate-500 font-bold">${catLabelsTitle[k]}</span>
+                                                <div class="flex items-center gap-3">
+                                                    <div class="flex items-baseline gap-0.5 w-auto justify-end">
+                                                        <span class="text-[10px] font-bold ${statusColor} truncate max-w-[150px] text-right" title="${escapeHtml(label)}">${escapeHtml(label)}</span>
+                                                    </div>
+                                                    <div class="w-14 flex justify-end text-[10px] text-slate-300">
+                                                        -
+                                                    </div>
+                                                </div>
+                                            </div>
+                                            ${extraInfo}
+                                        </div>`;
+                                    }).filter(Boolean).join('');
+
+                                    const detailsList = numDetailsList + catDetailsList;
+
+                                    if (detailsList) {
+                                        detailsHtml = `
+                                        <div id="${alertId}" class="hidden mt-3 pt-3 border-t ${s.border} border-dashed animate-in fade-in slide-in-from-top-2">
+                                            <div class="text-[10px] font-black text-slate-400 mb-1.5 flex items-center justify-between">
+                                                <div class="flex items-center gap-1"><i data-lucide="bar-chart-2" class="w-3 h-3"></i> 測定値詳細</div>
+                                                <span class="text-[8px] opacity-70">測定値 / 平均差</span>
+                                            </div>
+                                            <div class="grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-0.5 bg-white/50 p-2 rounded-lg">
+                                                ${detailsList}
+                                            </div>
+                                        </div>`;
+                                    }
+                                }
+                                
+                                return `
+                                <div class="${s.bg} ${s.hoverBg} border ${s.border} rounded-2xl p-4 flex flex-col cursor-pointer transition-all duration-200 shadow-sm hover:shadow-md hover:-translate-y-0.5 group" onclick="const d = document.getElementById('${alertId}'); if(d) { d.classList.toggle('hidden'); }">
+                                    <div class="flex gap-3 items-start">
+                                        <div class="mt-0.5 ${s.iconColor} bg-white p-1.5 rounded-full shadow-sm flex-shrink-0">
+                                            <i data-lucide="${s.icon}" class="w-4 h-4"></i>
+                                        </div>
+                                        <div class="flex-1">
+                                            <div class="flex items-center justify-between mb-1.5">
+                                                <div class="flex items-center gap-2">
+                                                    <span class="text-[10px] font-black ${s.labelText} ${s.labelBg} px-2 py-0.5 rounded uppercase tracking-wider">${s.label}</span>
+                                                    <span class="text-[11px] font-bold text-slate-400"><i data-lucide="clock" class="w-3 h-3 inline mr-0.5 mb-0.5"></i>${a.date.substring(0,16)}</span>
+                                                </div>
+                                                ${detailsHtml ? `<i data-lucide="chevron-down" class="w-4 h-4 text-slate-400 group-hover:text-slate-600 transition-colors"></i>` : ''}
+                                            </div>
+                                            ${mainMsg}
+                                            ${diseaseHtml}
+                                        </div>
+                                    </div>
+                                    ${detailsHtml}
+                                </div>
+                                `
+                            }).join('') : `
+                                <div class="text-center py-12 flex flex-col items-center justify-center opacity-70">
+                                    <div class="bg-slate-100 p-4 rounded-full mb-3"><i data-lucide="check-circle-2" class="w-8 h-8 text-slate-400"></i></div>
+                                    <p class="font-black text-slate-500">${state.alertModalMode === 'alertOnly' ? '現在、ヤバめな警報は出てないっしょ！✨' : '履歴がまだないみたいだぜ！'}</p>
+                                </div>
+                            `}
+                        </div>
+                    </div>
+                </div>
+            </div>
+            `;
+        }
+
+        function renderHistoryView() {
+            if (state.historyList.length === 0) {
+                return `
+                <div class="flex-1 flex flex-col items-center justify-center p-12">
+                    <div class="text-center animate-in fade-in">
+                        <div class="bg-slate-100 w-24 h-24 rounded-full flex items-center justify-center mx-auto mb-6">
+                            <i data-lucide="database" class="w-12 h-12 text-slate-300"></i>
+                        </div>
+                        <h2 class="text-2xl font-black text-slate-800 mb-3">履歴がないぜ！</h2>
+                        <p class="text-slate-500 font-bold mb-8">上の「読込」タブからCSVを選択してバイブス上げてこうぜ！</p>
+                    </div>
+                </div>`;
+            }
+
+            const allSelected = state.historyList.length > 0 && state.selectedHistoryIds.length === state.historyList.length;
+
+            return `<div class="p-4 max-w-5xl mx-auto w-full">
+                <div class="flex justify-between items-center mb-4">
+                    <h2 class="text-xl font-black text-slate-800">データ読み込み履歴</h2>
+                </div>
+                
+                <div class="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden animate-in fade-in">
+                    <div class="p-2 border-b border-slate-200 bg-slate-50 flex justify-between items-center">
+                        <label class="flex items-center gap-2 cursor-pointer font-bold text-slate-700 hover:text-blue-600 transition-colors ml-2">
+                            <input id="history-all-checkbox" type="checkbox" class="w-4 h-4 rounded text-blue-600 focus:ring-blue-500 cursor-pointer" ${allSelected ? 'checked' : ''} onchange="window.toggleHistoryAll()" />
+                            <span class="text-xs">全選択</span>
+                        </label>
+                        <div class="flex items-center gap-4">
+                            <div class="text-xs font-bold text-slate-500">選択中: <span id="history-selected-count" class="text-blue-600">${state.selectedHistoryIds.length}</span> 件</div>
+                            <button id="history-delete-btn" onclick="window.requestHistoryDelete()" class="bg-red-50 text-red-600 px-3 py-1.5 rounded-lg font-bold text-xs border border-red-100 transition-all hover:bg-red-100 active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed" ${state.selectedHistoryIds.length === 0 ? 'disabled' : ''}>
+                                <i data-lucide="trash-2" class="w-3.5 h-3.5 inline-block align-text-bottom mr-1"></i>データ削除
+                            </button>
+                        </div>
+                    </div>
+
+                    <div class="divide-y divide-slate-100">
+                        ${state.historyList.map(h => `
+                            <label id="history-row-${h.id}" class="flex flex-col md:flex-row md:items-center gap-2 p-1.5 hover:bg-blue-50 cursor-pointer transition-colors relative group ${state.selectedHistoryIds.includes(h.id) ? 'bg-blue-50' : ''}">
+                                
+                                <div class="flex items-center pl-2">
+                                    <input id="history-checkbox-${h.id}" type="checkbox" class="w-4 h-4 rounded text-blue-600 focus:ring-blue-500 cursor-pointer" ${state.selectedHistoryIds.includes(h.id) ? 'checked' : ''} onchange="window.toggleHistorySelection(event, '${h.id}')" />
+                                </div>
+
+                                <div class="flex items-center gap-2 flex-shrink-0">
+                                    <div class="bg-blue-100 text-blue-700 px-2 py-1 rounded-md font-black text-[10px] flex items-center gap-1 whitespace-nowrap shadow-sm border border-blue-200">
+                                        <i data-lucide="calendar" class="w-3 h-3"></i>${h.createdAt}
+                                    </div>
+                                </div>
+                                
+                                <div class="font-bold text-slate-800 text-xs truncate flex-1 flex items-center gap-2">
+                                    <i data-lucide="file-text" class="w-3.5 h-3.5 text-slate-400 flex-shrink-0"></i>
+                                    <span class="truncate">${escapeHtml(h.fileNames)}</span>
+                                </div>
+                                
+                                <div class="flex items-center gap-4 text-[10px] flex-shrink-0 md:ml-auto pr-4">
+                                    <div class="flex flex-col items-end">
+                                        <span class="text-[8px] text-slate-400 font-black uppercase tracking-wider">利用者</span>
+                                        <span class="font-bold text-slate-700">${h.userCount} <span class="text-[8px] text-slate-400 font-normal">名</span></span>
+                                    </div>
+                                    <div class="flex flex-col items-end">
+                                        <span class="text-[8px] text-slate-400 font-black uppercase tracking-wider">データ</span>
+                                        <span class="font-bold text-slate-700">${h.recordCount} <span class="text-[8px] text-slate-400 font-normal">件</span></span>
+                                    </div>
+                                </div>
+                            </label>
+                        `).join('')}
+                    </div>
+                </div>
+            </div>`;
+        }
+
+        function renderUploadView() {
+            return `<div class="max-w-xl mx-auto mt-12 p-6 w-full"><div class="bg-white rounded-3xl border border-slate-200 shadow-xl overflow-hidden"><div class="bg-slate-50 p-10 text-center border-b border-slate-100"><i data-lucide="database" class="w-12 h-12 text-blue-500 mx-auto mb-4"></i><h2 class="text-2xl font-black">データ読込</h2><p class="text-slate-500 mt-2 text-sm">大容量CSVもIndexedDBで余裕っしょ！</p></div><div class="p-8 grid gap-4"><label class="flex flex-col items-center justify-center p-12 border-2 border-dashed border-blue-200 rounded-2xl bg-blue-50/50 hover:bg-blue-100 transition-all cursor-pointer"><i data-lucide="file-up" class="w-10 h-10 text-blue-500 mb-4"></i><span class="font-bold">CSV選択</span><input type="file" accept=".csv" multiple class="hidden" onchange="window.handleMultipleFileUpload(event)" /></label></div></div></div>`;
+        }
+
+        function renderSplitView() {
+            if (state.historyList.length === 0) return `<div class="p-12 text-center font-bold text-slate-400">データがないぜ！読込タブからCSVを入れてな！</div>`;
+
+            const q = normalizeForSearch(state.searchQuery);
+            
+            const groupedUsers = {};
+            processedData.userList.forEach(u => {
+                const office = u.officeName || '未所属';
+                if (!groupedUsers[office]) groupedUsers[office] = [];
+                groupedUsers[office].push(u);
+            });
+
+            let userListHtml = '';
+            Object.keys(groupedUsers).sort().forEach(office => {
+                const usersInOffice = groupedUsers[office];
+
+                if (state.expandedGroups[office] === undefined) {
+                    state.expandedGroups[office] = true;
+                }
+                const isExpanded = q ? true : state.expandedGroups[office];
+
+                userListHtml += `
+                <div class="sidebar-group mb-1" data-office="${escapeHtml(office)}">
+                    <div class="sticky top-0 z-20 bg-white px-1.5 py-0.5">
+                        <button onclick="window.toggleGroup('${escapeHtml(office)}')" class="w-full text-left px-2 py-1.5 bg-slate-100 rounded-md text-[10px] font-black text-slate-600 flex items-center justify-between hover:bg-slate-200 transition-colors focus:outline-none shadow-sm border border-slate-200">
+                            <span class="truncate flex items-center gap-1.5"><i data-lucide="building-2" class="w-3 h-3 text-slate-400"></i>${escapeHtml(office)} <span class="text-slate-400 font-normal">(${usersInOffice.length})</span></span>
+                            <div class="flex-shrink-0">
+                                <i data-lucide="chevron-down" class="chevron-down-icon w-3.5 h-3.5 text-slate-400 ${isExpanded ? 'block' : 'hidden'}"></i>
+                                <i data-lucide="chevron-right" class="chevron-right-icon w-3.5 h-3.5 text-slate-400 ${isExpanded ? 'hidden' : 'block'}"></i>
+                            </div>
+                        </button>
+                    </div>
+                    <div class="${isExpanded ? 'block' : 'hidden'} sidebar-group-content space-y-0.5 pl-3 pr-1.5 pb-1 mt-0.5 border-l-2 border-slate-100 ml-3">
+                        ${usersInOffice.map(u => {
+                            const alertStatus = checkAlertStatus(u);
+                            return `
+                            <button onclick="window.setSelectedUserId('${escapeHtml(u.uid)}')" data-user-id="${u.uid}" data-search-target="true" data-name="${escapeHtml(u.name)}" data-kana="${escapeHtml(u.kanaName)}" class="user-sidebar-item w-full text-left p-1.5 rounded-md transition-all flex flex-col group ${state.selectedUserId === u.uid && state.view === 'user-detail' ? 'active shadow-sm' : 'hover:bg-blue-50'}">
+                                <span class="text-[8px] font-bold leading-none mb-0.5 ${state.selectedUserId === u.uid && state.view === 'user-detail' ? 'text-blue-500' : 'text-slate-400'}">${escapeHtml(u.kanaName)}</span>
+                                <span class="text-xs font-bold leading-none truncate flex items-center gap-1">
+                                    ${escapeHtml(u.name)}
+                                    <i data-lucide="bell" class="w-3 h-3 flex-shrink-0 ${alertStatus.hasRed ? 'text-red-500 fill-red-500' : 'text-slate-300 fill-slate-300'}"></i>
+                                </span>
+                            </button>`
+                        }).join('')}
+                    </div>
+                </div>`;
+            });
+
+            if (userListHtml === '') {
+                userListHtml = `<div class="p-4 text-center text-xs text-slate-400 font-bold">該当する利用者がいません</div>`;
+            }
+
+            const sidebarHTML = `
+                <div id="main-sidebar" class="transition-all duration-300 ease-in-out bg-white flex flex-col h-[calc(100vh-53px)] sticky top-[53px] flex-shrink-0 border-r border-slate-200 z-40 ${state.isSidebarOpen ? 'w-64 opacity-100' : 'w-0 opacity-0 overflow-hidden border-r-0'}">
+                    <div class="flex flex-col h-full w-64 bg-white relative">
+                        <div class="flex-none bg-white z-50 relative shadow-sm border-b border-slate-200 pt-3 px-3 pb-3">
+                            <div class="relative mb-2">
+                                <i data-lucide="search" class="w-3.5 h-3.5 absolute left-2 top-1/2 -translate-y-1/2 text-slate-400"></i>
+                                <input 
+                                    id="searchInput"
+                                    type="text" 
+                                    placeholder="名前で検索..." 
+                                    class="w-full bg-slate-50 border border-slate-200 rounded-md pl-7 pr-2 py-1.5 text-xs focus:ring-2 focus:ring-blue-500 outline-none"
+                                    value="${escapeHtml(state.searchQuery)}"
+                                    oninput="window.handleSearchInput(this.value)"
+                                />
+                            </div>
+                            <button id="sidebar-item-dashboard" onclick="window.showDashboard()" class="user-sidebar-item w-full text-left p-2 rounded-md transition-all flex items-center gap-2 group bg-white border ${state.view === 'dashboard' ? 'active shadow-sm border-blue-400' : 'border-slate-200 hover:bg-blue-50'}">
+                                <i data-lucide="layout-dashboard" class="w-4 h-4 ${state.view === 'dashboard' ? 'text-blue-500' : 'text-slate-400'}"></i>
+                                <span class="text-sm font-bold truncate ${state.view === 'dashboard' ? 'text-blue-700' : 'text-slate-700'}">すべて (全体一覧)</span>
+                            </button>
+                        </div>
+                        <div id="sidebar-scroll-container" class="flex-1 overflow-y-auto custom-scrollbar bg-white relative z-10 px-2 pt-1 pb-2">
+                            ${userListHtml}
+                            <div id="sidebar-no-result" class="p-4 text-center text-xs text-slate-400 font-bold" style="display: none;">該当する利用者がいません</div>
+                        </div>
+                        <div class="p-2 bg-slate-50 border-t border-slate-200 text-[9px] text-slate-500 font-bold text-center flex-none z-20 relative">十字キー &uarr; &darr; 移動</div>
+                    </div>
+                </div>`;
+
+            let mainContent = '';
+            if (state.view === 'dashboard') {
+                mainContent = renderDashboardContent();
+            } else {
+                mainContent = renderDetailContent();
+            }
+
+            return `<div class="flex flex-row overflow-hidden flex-1">${sidebarHTML}${mainContent}</div>`;
+        }
+
+        function renderDashboardContent() {
+            return `
+            <div class="flex flex-col h-[calc(100vh-53px)] w-full overflow-hidden bg-slate-50 relative">
+                <div class="flex-none bg-slate-50 px-4 pt-4 relative z-40 shadow-sm border-b border-slate-200">
+                    <div class="flex items-center justify-between px-2 mb-3">
+                        <h2 class="text-lg font-black text-slate-800">全体一覧</h2>
+                        <div class="flex items-center gap-3">
+                            <div class="text-[10px] text-slate-400 flex items-center gap-1 max-w-[150px] md:max-w-xs truncate">
+                                <span class="font-bold text-blue-500 bg-blue-50 px-2 py-0.5 rounded mr-1">表示中</span>
+                                <span class="truncate">${state.selectedOffice} (${processedData.userList.length} 名)</span>
+                            </div>
+                            <button onclick="window.openCSVModal('all')" class="flex items-center gap-1.5 bg-white border border-slate-200 text-slate-600 hover:bg-green-50 hover:text-green-600 hover:border-green-200 px-3 py-1.5 rounded-lg text-xs font-bold transition-all shadow-sm active:scale-95">
+                                <i data-lucide="file-spreadsheet" class="w-3.5 h-3.5"></i>Excel出力
+                            </button>
+                        </div>
+                    </div>
+                    <div class="grid grid-cols-12 gap-2 p-1.5 py-2 text-[9px] font-black text-slate-400 uppercase tracking-widest hidden md:grid">
+                        <div class="col-span-3 pl-2">利用者名</div>
+                        <div class="col-span-3">血圧 平均 &rarr; 最新</div>
+                        <div class="col-span-2">最新変動値</div>
+                        <div class="col-span-4">ステータス</div>
+                    </div>
+                </div>
+                
+                <div id="dashboard-scroll-container" class="flex-1 overflow-y-auto px-4 pb-4 custom-scrollbar w-full bg-slate-50 relative z-10 pt-2">
+                    <div class="divide-y divide-slate-50 bg-white rounded-xl border border-slate-200 shadow-sm min-h-full">
+                        ${processedData.userList.map(u => {
+                            const latestSysRecord = [...u.allRecords].reverse().find(r => isValidVital('sysBP', r.sysBP));
+                            const latestDiaRecord = [...u.allRecords].reverse().find(r => isValidVital('diaBP', r.diaBP));
+                            const avgSys = u.overallAverages.sysBP !== undefined ? Math.floor(u.overallAverages.sysBP) : '-';
+                            const avgDia = u.overallAverages.diaBP !== undefined ? Math.floor(u.overallAverages.diaBP) : '-';
+                            const lSys = latestSysRecord ? parseFloat(latestSysRecord.sysBP).toFixed(0) : '-';
+                            const lDia = latestDiaRecord ? parseFloat(latestDiaRecord.diaBP).toFixed(0) : '-';
+                            const date = latestSysRecord?.date?.substring(0, 10) || latestDiaRecord?.date?.substring(0, 10) || '';
+                            const alertStatus = checkAlertStatus(u);
+
+                            return `<div onclick="window.setSelectedUserId('${escapeHtml(u.uid)}')" class="dashboard-user-row grid grid-cols-1 md:grid-cols-12 gap-1 p-1 py-1.5 items-center hover:bg-blue-100 cursor-pointer transition-colors border-b border-slate-50" data-name="${escapeHtml(u.name)}" data-kana="${escapeHtml(u.kanaName)}">
+                                <div class="col-span-3 flex flex-col pl-2"><span class="text-[8px] text-slate-400 font-bold leading-none mb-0.5">${escapeHtml(u.kanaName)}</span><span class="font-bold text-slate-700 text-xs leading-none flex items-center gap-1">${escapeHtml(u.name)} <i data-lucide="bell" class="w-3.5 h-3.5 cursor-pointer hover:scale-110 transition-transform ${alertStatus.hasRed ? 'text-red-500 fill-red-500' : 'text-slate-300 fill-slate-300'}" onclick="window.openAlertHistory('${u.uid}', event)" title="アラート履歴を表示"></i></span></div>
+                                <div class="col-span-3 flex items-center gap-1.5 text-[10px]"><div><span class="text-[8px] block text-slate-400 font-bold leading-none mb-0.5">平均</span>${avgSys}/${avgDia}</div><i data-lucide="chevron-right" class="w-3 h-3 text-slate-300"></i><div><span class="text-[8px] block text-blue-400 font-bold leading-none mb-0.5">最新 (${date})</span>${lSys}/${lDia}</div></div>
+                                <div class="col-span-2 flex items-center gap-1 text-[11px]">${formatDev(latestSysRecord?.deviations?.sysBP)}<span class="text-slate-300">/</span>${formatDev(latestDiaRecord?.deviations?.diaBP)}</div>
+                                <div id="dashboard-status-${u.uid}" class="col-span-4">${u.isDiscontinued ? `<div class="text-red-500 text-[9px] font-bold truncate">停止: ${escapeHtml(u.discontinueReason || u.discontinueNote || '理由なし')}</div>` : `<span class="text-green-500 text-[9px] font-bold">継続中</span>`}</div>
+                            </div>`}).join('')}
+                    </div>
+                </div>
+            </div>`;
+        }
+
+        function renderDetailContent() {
+            const u = processedData.userStatsMap[state.selectedUserId];
+            if (!u) return `<div class="flex-1 p-12 text-center text-slate-400 font-bold">左のリストから利用者を選択してな！✨</div>`;
+
+            const labels = { pulse: '脈拍', spo2: 'SpO2', temp: '体温', respRate: '呼吸数', weight: '体重', sleepTime: '睡眠時間', waterIntake: '水分量', walkTime5m: '5m歩行', bmi: 'BMI', bloodSugar: '血糖値' };
+            const units = { pulse: 'bpm', spo2: '%', temp: '℃', respRate: '回/分', weight: 'kg', sleepTime: '', waterIntake: 'ml', walkTime5m: '秒', bmi: '', bloodSugar: 'mg/dL' };
+            const icons = { pulse: 'heart-pulse', spo2: 'wind', temp: 'thermometer', respRate: 'activity', weight: 'scale', sleepTime: 'moon', waterIntake: 'droplet', walkTime5m: 'footprints', bmi: 'calculator', bloodSugar: 'test-tube' };
+            const catIcons = { medRecord: 'pill', oralEnv: 'smile', turgor: 'hand', anorexia: 'utensils', backPain: 'activity', urinationPain: 'droplets', angina: 'heart' };
+            
+            const latestSysValid = [...u.allRecords].reverse().find(r => isValidVital('sysBP', r.sysBP));
+            const latestDiaValid = [...u.allRecords].reverse().find(r => isValidVital('diaBP', r.diaBP));
+            
+            const avgSys = u.overallAverages.sysBP || 0;
+            const avgDia = u.overallAverages.diaBP || 0;
+            const nowSys = latestSysValid ? parseFloat(latestSysValid.sysBP) : null;
+            const nowDia = latestDiaValid ? parseFloat(latestDiaValid.diaBP) : null;
+
+            const devSys = latestSysValid?.deviations?.sysBP !== undefined && latestSysValid.deviations.sysBP !== null ? latestSysValid.deviations.sysBP : (avgSys && nowSys !== null ? (nowSys - avgSys) : null);
+            const devDia = latestDiaValid?.deviations?.diaBP !== undefined && latestDiaValid.deviations.diaBP !== null ? latestDiaValid.deviations.diaBP : (avgDia && nowDia !== null ? (nowDia - avgDia) : null);
+
+            const bpColorClass = (!latestSysValid && !latestDiaValid) ? 'text-slate-600 bg-slate-50 border-slate-100' : (devSys > 15 ? 'text-red-600 bg-red-50 border-red-100' : devSys < -15 ? 'text-blue-600 bg-blue-50 border-blue-100' : 'text-slate-600 bg-slate-50 border-slate-100');
+
+            const bpCard = `
+            <div class="border p-3.5 rounded-xl ${bpColorClass} shadow-sm flex flex-col justify-between transition-all hover:shadow-md bg-white">
+                <div class="flex justify-between items-start mb-1.5 gap-2">
+                    <div class="text-[10px] font-black text-slate-500 uppercase tracking-wider flex items-center gap-1 shrink-0">
+                        <i data-lucide="activity" class="w-3.5 h-3.5"></i>血圧
+                    </div>
+                    <div class="flex flex-col items-center bg-white/60 px-1.5 py-0.5 rounded-lg border border-slate-100 shadow-sm backdrop-blur-sm min-w-0 w-[60px]">
+                        <div class="w-full text-center text-[8px] text-slate-400 font-bold mb-0.5 leading-none">平均差</div>
+                        <div class="flex items-center justify-center text-[10px] font-black leading-none whitespace-nowrap w-full">
+                            ${formatDev(devSys)} <span class="text-slate-300 mx-0.5">/</span> ${formatDev(devDia)}
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="flex items-baseline gap-0.5 my-0.5">
+                    <div class="text-2xl font-black tracking-tighter text-slate-700">${latestSysValid ? nowSys.toFixed(0) : '-'}</div>
+                    <div class="text-base font-bold text-slate-400 tracking-tighter">/${latestDiaValid ? nowDia.toFixed(0) : '-'}</div>
+                    <div class="text-[9px] font-bold text-slate-400 ml-1">mmHg</div>
+                </div>
+                
+                <div class="flex justify-between items-end mt-2 pt-1.5 border-t border-slate-200/50">
+                    <div class="text-[9px] font-bold text-slate-500">
+                        <span class="text-slate-400 mr-1">平均</span>${avgSys ? Math.floor(avgSys) : '-'}/${avgDia ? Math.floor(avgDia) : '-'}
+                    </div>
+                    <div class="text-[8px] font-bold text-slate-400 flex items-center gap-1">
+                        <i data-lucide="clock" class="w-2.5 h-2.5"></i>${latestSysValid?.date?.substring(0,10) || latestDiaValid?.date?.substring(0,10) || '-'}
+                    </div>
+                </div>
+            </div>`;
+
+            const cardMap = {};
+            cardMap['bp'] = bpCard;
+
+            ['pulse', 'spo2', 'temp', 'respRate', 'weight', 'bmi', 'bloodSugar', 'sleepTime', 'waterIntake', 'walkTime5m'].forEach(k => {
+                const isTemp = k === 'temp';
+                const latestValid = [...u.allRecords].reverse().find(r => isValidVital(k, r[k]));
+                
+                const avg = u.overallAverages[k] || 0;
+                const now = latestValid ? parseFloat(latestValid[k]) : null;
+                const dev = latestValid?.deviations?.[k] !== undefined && latestValid.deviations[k] !== null ? latestValid.deviations[k] : (avg && now !== null ? (now - avg) : null);
+                
+                const colorClass = now === null ? 'text-slate-600 bg-slate-50 border-slate-100' : (dev > 15 ? 'text-red-600 bg-red-50 border-red-100' : dev < -15 ? 'text-blue-600 bg-blue-50 border-blue-100' : 'text-slate-600 bg-slate-50 border-slate-100');
+                
+                let nowDisplay = latestValid ? now.toFixed(isTemp ? 1 : 0) : '-';
+                let avgDisplay = avg ? (isTemp ? avg.toFixed(1) : Math.floor(avg)) : '-';
+                let unitDisplay = units[k] ? `<div class="text-[9px] font-bold text-slate-400 ml-1">${units[k]}</div>` : '';
+                
+                if (k === 'sleepTime') {
+                    nowDisplay = latestValid ? formatSleepTime(now) : '-';
+                    avgDisplay = avg ? formatSleepTime(avg) : '-';
+                    unitDisplay = ''; 
+                }
+
+                cardMap[k] = `
+                <div class="border p-3.5 rounded-xl ${colorClass} shadow-sm flex flex-col justify-between transition-all hover:shadow-md bg-white">
+                    <div class="flex justify-between items-start mb-1.5 gap-2">
+                        <div class="text-[10px] font-black text-slate-500 uppercase tracking-wider flex items-center gap-1 shrink-0">
+                            <i data-lucide="${icons[k]}" class="w-3.5 h-3.5"></i>${labels[k]}
+                        </div>
+                        <div class="flex flex-col items-center bg-white/60 px-1.5 py-0.5 rounded-lg border border-slate-100 shadow-sm backdrop-blur-sm min-w-0 w-[60px]">
+                            <div class="w-full text-center text-[8px] text-slate-400 font-bold mb-0.5 leading-none">平均差</div>
+                            <div class="flex items-center justify-center text-[10px] font-black leading-none whitespace-nowrap w-full">
+                                ${formatDev(now === null ? null : dev, isTemp, k === 'sleepTime')}
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="flex items-baseline gap-0.5 my-0.5">
+                        <div class="text-2xl font-black tracking-tighter text-slate-700">${nowDisplay}</div>
+                        ${unitDisplay}
+                    </div>
+                    
+                    <div class="flex justify-between items-end mt-2 pt-1.5 border-t border-slate-200/50">
+                        <div class="text-[9px] font-bold text-slate-500">
+                            <span class="text-slate-400 mr-1">平均</span>${avgDisplay}
+                        </div>
+                        <div class="text-[8px] font-bold text-slate-400 flex items-center gap-1">
+                            <i data-lucide="clock" class="w-2.5 h-2.5"></i>${latestValid?.date?.substring(0,10) || '-'}
+                        </div>
+                    </div>
+                </div>`;
+            });
+
+            ['medRecord', 'oralEnv', 'turgor', 'anorexia', 'backPain', 'urinationPain', 'angina'].forEach(k => {
+                const latestValid = [...u.allRecords].reverse().find(r => isValidVital(k, r[k]));
+                const now = latestValid ? parseFloat(latestValid[k]) : null;
+                
+                let bgClass = 'bg-white border-slate-200 text-slate-800 opacity-70';
+                let iconColor = 'text-slate-400';
+                let titleColor = 'text-slate-400';
+                
+                if (now !== null) {
+                    if (now === 30 || (k === 'fallHistory' && now === 20)) {
+                        bgClass = 'bg-red-50 border-red-200 text-red-900';
+                        iconColor = 'text-red-500';
+                        titleColor = 'text-red-700';
+                    } else if (now === 20) {
+                        bgClass = 'bg-amber-50 border-amber-200 text-amber-900';
+                        iconColor = 'text-amber-500';
+                        titleColor = 'text-amber-700';
+                    } else {
+                        bgClass = 'bg-green-50 border-green-200 text-green-900';
+                        iconColor = 'text-green-500';
+                        titleColor = 'text-green-700';
+                    }
+                }
+
+                let labelHtml = `<div class="text-base font-black truncate my-1">-</div>`;
+
+                if (now !== null) {
+                    if (k === 'medRecord') {
+                        const texts = {
+                            10: ['服薬数5種類以下', '服薬コンプライアンス問題なし'],
+                            20: ['服薬数5種類以上', 'または服薬コンプライアンス問題あり'],
+                            30: ['服薬数5種類以上', '服薬コンプライアンス問題あり']
+                        }[now] || [now, ''];
+                        labelHtml = `
+                        <div class="my-1 flex flex-col justify-center gap-0.5 min-h-[32px]">
+                            <div class="text-[11px] font-black leading-tight">${texts[0]}</div>
+                            <div class="text-[10px] font-bold opacity-80 leading-tight">${texts[1]}</div>
+                        </div>`;
+                    } else if (k === 'oralEnv') {
+                        const text = { 10: '問題なし', 20: '軽度(歯肉炎)疑い', 30: '重度(歯周病)疑い' }[now] || now;
+                        labelHtml = `<div class="text-base font-black truncate my-1">${text}</div>`;
+                    } else {
+                        const text = catLabels[k][now] || now;
+                        const textClass = text.length > 8 ? 'text-[12px] leading-snug whitespace-normal break-words font-black' : 'text-base font-black truncate';
+                        labelHtml = `<div class="${textClass} my-1">${text}</div>`;
+                    }
+                }
+
+                cardMap[k] = `<div class="border p-3.5 rounded-xl ${bgClass} shadow-sm flex flex-col justify-between transition-all hover:shadow-md">
+                    <div class="text-[10px] font-black text-slate-500 uppercase tracking-wider mb-1.5 flex items-center gap-1 shrink-0">
+                        <i data-lucide="${catIcons[k]}" class="w-3.5 h-3.5 ${iconColor}"></i>${catLabelsTitle[k]}
+                    </div>
+                    ${labelHtml}
+                    <div class="flex justify-between items-end mt-2 pt-1.5 border-t ${now === null ? 'border-slate-100' : bgClass.replace('bg-', 'border-').replace('50', '200')}/50">
+                        <div></div>
+                        <div class="text-[8px] font-bold opacity-70 flex items-center gap-1">
+                            <i data-lucide="clock" class="w-2.5 h-2.5"></i>${latestValid ? latestValid.date.substring(0,10) : '-'}
+                        </div>
+                    </div>
+                </div>`;
+            });
+
+            const falls = u.allRecords.filter(r => isValidVital('fallHistory', r.fallHistory) && parseFloat(r.fallHistory) === 20).reverse();
+            const latestFall = [...u.allRecords].reverse().find(r => isValidVital('fallHistory', r.fallHistory));
+            const nowFall = latestFall ? parseFloat(latestFall.fallHistory) : null;
+            
+            const isFallNow = nowFall === 20;
+            let bgClass = 'bg-white border-slate-200 text-slate-800 opacity-70';
+            let iconColor = 'text-slate-400';
+            let titleColor = 'text-slate-400';
+            
+            if (nowFall !== null || falls.length > 0) {
+                if (isFallNow) {
+                    bgClass = 'bg-red-50 border-red-200 text-red-900';
+                    iconColor = 'text-red-500';
+                    titleColor = 'text-red-700';
+                } else if (falls.length > 0) {
+                    bgClass = 'bg-amber-50 border-amber-200 text-amber-900';
+                    iconColor = 'text-amber-500';
+                    titleColor = 'text-amber-700';
+                } else {
+                    bgClass = 'bg-green-50 border-green-200 text-green-900';
+                    iconColor = 'text-green-500';
+                    titleColor = 'text-green-700';
+                }
+            }
+
+            let fallStatusText = 'なし';
+            if (falls.length > 0) fallStatusText = 'あり';
+
+            let fallListHtml = '';
+            if (falls.length > 0) {
+                fallListHtml = `<div class="mt-2 text-[9px] border-t ${isFallNow ? 'border-red-200/50' : 'border-amber-200/50'} pt-1.5 h-10 overflow-y-auto custom-scrollbar">
+                    <div class="font-bold mb-0.5 opacity-80 leading-none flex justify-between">
+                        <span>最新: ${falls[0].date.substring(0,10)}</span>
+                        <span>計 ${falls.length} 回</span>
+                    </div>
+                    ${falls.length > 1 ? `<div class="leading-tight mt-1 text-[8px] text-slate-500">${falls.slice(1).map(f => `<div>・${f.date.substring(0,10)}</div>`).join('')}</div>` : ''}
+                </div>`;
+            } else {
+                fallListHtml = `<div class="mt-2 text-[9px] border-t ${nowFall === null ? 'border-slate-100' : 'border-green-200/50'} pt-1.5 opacity-60">転倒履歴なし</div>`;
+            }
+
+            cardMap['fallHistory'] = `<div class="border p-3.5 rounded-xl ${bgClass} shadow-sm flex flex-col justify-between transition-all hover:shadow-md">
+                <div class="text-[10px] font-black text-slate-500 uppercase tracking-wider mb-1.5 flex items-center gap-1">
+                    <i data-lucide="alert-octagon" class="w-3.5 h-3.5 ${iconColor}"></i>転倒歴
+                </div>
+                <div class="text-base font-black my-1 flex items-end gap-2">
+                    ${nowFall === null && falls.length === 0 ? '-' : fallStatusText}
+                </div>
+                ${fallListHtml}
+            </div>`;
+
+            const orderedCardsHtml = displayOrder.map(k => cardMap[k] || '').join('');
+
+            const alertStatus = checkAlertStatus(u);
+            const bellBtnClass = alertStatus.hasRed 
+                ? 'text-red-500 hover:text-red-600 bg-red-50 hover:bg-red-100' 
+                : 'text-slate-400 hover:text-slate-500 bg-slate-100 hover:bg-slate-200';
+            const bellIconClass = alertStatus.hasRed ? 'fill-red-500' : 'fill-slate-300';
+            
+            let chartsHTML = '';
+            displayOrder.forEach(k => {
+                let chartId = k === 'bp' ? 'bpChart' : `${k}Chart`;
+                chartsHTML += `<div class="h-[160px]"><canvas id="${chartId}"></canvas></div>`;
+            });
+
+            return `
+            <div id="detail-scroll-container" class="flex-1 p-4 space-y-4 overflow-y-auto h-[calc(100vh-53px)] animate-in slide-in-from-right-4">
+                <div class="grid grid-cols-1 lg:grid-cols-3 xl:grid-cols-4 gap-4">
+                    <div class="space-y-4 col-span-1">
+                        <div class="bg-white rounded-2xl border border-slate-200 p-4 shadow-sm relative overflow-hidden">
+                            <div id="detail-color-bar" class="absolute top-0 left-0 w-full h-1.5 ${u.isDiscontinued ? 'bg-red-500' : 'bg-green-500'}"></div>
+                            <div class="flex justify-between items-start mt-1">
+                                <div class="flex items-center gap-3">
+                                    <div class="w-12 h-12 bg-slate-100 rounded-full flex items-center justify-center text-xl font-black text-slate-400">${u.kanaName.charAt(0)}</div>
+                                    <div>
+                                        <div class="text-[10px] text-slate-400 mb-0.5">${escapeHtml(u.kanaName)}</div>
+                                        <h2 class="text-xl font-bold text-slate-900 leading-tight flex items-center gap-2">
+                                            ${escapeHtml(u.name)}
+                                            <button onclick="window.openAlertHistory('${u.uid}')" class="${bellBtnClass} transition-colors p-1.5 rounded-full shadow-sm" title="アラート履歴を表示">
+                                                <i data-lucide="bell" class="w-4 h-4 ${bellIconClass}"></i>
+                                            </button>
+                                        </h2>
+                                        <div class="text-[10px] text-slate-500 mt-1 flex items-center gap-1"><i data-lucide="building-2" class="w-3 h-3"></i> ${escapeHtml(u.officeName)}</div>
+                                    </div>
+                                </div>
+                                <button onclick="window.openCSVModal('${u.uid}')" class="text-slate-400 hover:text-green-600 bg-slate-50 hover:bg-green-50 border border-slate-100 p-2 rounded-lg transition-all shadow-sm active:scale-95" title="この利用者のデータを出力">
+                                    <i data-lucide="file-spreadsheet" class="w-4 h-4"></i>
+                                </button>
+                            </div>
+                        </div>
+
+                        <div class="grid grid-cols-2 gap-2">
+                            ${orderedCardsHtml}
+                        </div>
+
+                        <div class="bg-white rounded-2xl border border-slate-200 p-4 shadow-sm">
+                            <h4 class="font-bold text-slate-800 text-sm flex items-center gap-2 mb-3"><i data-lucide="file-text" class="w-4 h-4 text-slate-400"></i> ステータス編集</h4>
+                            <div id="status-edit-container">
+                                ${generateStatusEditHTML(u)}
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="lg:col-span-2 xl:col-span-3 space-y-4">
+                        <div class="bg-white rounded-2xl border border-slate-200 p-4 shadow-sm">
+                            <div class="flex flex-wrap justify-between items-center mb-4 gap-2">
+                                <h3 class="font-black text-sm text-slate-800 flex items-center gap-1.5"><i data-lucide="calendar" class="w-4 h-4 text-indigo-500"></i> トレンド推移</h3>
+                                <div class="flex flex-col sm:flex-row items-end sm:items-center gap-2">
+                                    <div class="bg-slate-100 p-1 rounded-md flex gap-1">
+                                        ${[['1w', '1週'], ['1m', '最新1月'], ['3m', '3ヶ月'], ['all', '全期間'], ['custom', '期間指定']].map(([v, l]) => `
+                                            <button 
+                                                onclick="window.setGraphPeriod('${v}')" 
+                                                class="px-2 py-0.5 rounded text-[9px] font-black transition-all ${state.graphPeriod === v ? 'bg-white text-blue-600 shadow-sm' : 'text-slate-400 hover:text-slate-600'}"
+                                            >${l}</button>
+                                        `).join('')}
+                                    </div>
+                                    ${state.graphPeriod === 'custom' ? `
+                                    <div class="flex items-center gap-1 bg-slate-50 p-1 rounded-md border border-slate-100 animate-in fade-in slide-in-from-right-2">
+                                        <input type="date" class="bg-white border border-slate-200 rounded px-1.5 py-0.5 text-[9px] font-bold text-slate-600 outline-none focus:border-blue-400 focus:ring-1 focus:ring-blue-400" value="${state.customStartDate}" onchange="window.setCustomDate('start', this.value)">
+                                        <span class="text-[9px] text-slate-400 font-bold">〜</span>
+                                        <input type="date" class="bg-white border border-slate-200 rounded px-1.5 py-0.5 text-[9px] font-bold text-slate-600 outline-none focus:border-blue-400 focus:ring-1 focus:ring-blue-400" value="${state.customEndDate}" onchange="window.setCustomDate('end', this.value)">
+                                    </div>
+                                    ` : ''}
+                                </div>
+                            </div>
+                            
+                            <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                                ${chartsHTML}
+                            </div>
+
+                        </div>
+                        <div class="bg-white rounded-2xl border border-slate-200 p-4 shadow-sm">
+                            <h3 class="font-black text-sm text-slate-800 mb-4 flex items-center gap-1.5"><i data-lucide="trending-up" class="w-4 h-4 text-red-500"></i> 異常変動アラート</h3>
+                            <div class="h-[220px] bg-slate-50 rounded-xl p-2 border border-slate-100"><canvas id="trendChart"></canvas></div>
+                        </div>
+                    </div>
+                </div>
+            </div>`;
+        }
+
+        function renderCharts() {
+            const u = processedData.userStatsMap[state.selectedUserId]; if (!u) return;
+            
+            const chartIds = [
+                'bpChart', 'pulseChart', 'spo2Chart', 'tempChart', 'bmiChart', 'weightChart', 
+                'bloodSugarChart', 'respRateChart', 'sleepTimeChart', 'waterIntakeChart', 'walkTime5mChart',
+                'turgorChart', 'anorexiaChart', 'medRecordChart', 'backPainChart', 'urinationPainChart', 'anginaChart', 
+                'oralEnvChart', 'fallHistoryChart', 'trendChart'
+            ];
+            
+            chartIds.forEach(id => {
+                if (chartInstances[id]) chartInstances[id].destroy();
+            });
+
+            const filterByPeriod = (records) => {
+                const validRecords = records.filter(r => 
+                    isValidVital('sysBP', r.sysBP) || isValidVital('diaBP', r.diaBP) || isValidVital('pulse', r.pulse) || 
+                    isValidVital('spo2', r.spo2) || isValidVital('temp', r.temp) || isValidVital('bmi', r.bmi) || 
+                    isValidVital('weight', r.weight) || isValidVital('bloodSugar', r.bloodSugar) || isValidVital('respRate', r.respRate) || 
+                    isValidVital('sleepTime', r.sleepTime) || isValidVital('waterIntake', r.waterIntake) || isValidVital('walkTime5m', r.walkTime5m) || 
+                    isValidVital('turgor', r.turgor) || isValidVital('anorexia', r.anorexia) || isValidVital('medRecord', r.medRecord) || 
+                    isValidVital('backPain', r.backPain) || isValidVital('urinationPain', r.urinationPain) || isValidVital('angina', r.angina) || isValidVital('oralEnv', r.oralEnv) || isValidVital('fallHistory', r.fallHistory)
+                );
+
+                if (validRecords.length === 0) return [];
+                if (state.graphPeriod === 'all') return validRecords;
+                
+                if (state.graphPeriod === 'custom') {
+                    if (!state.customStartDate && !state.customEndDate) return validRecords;
+                    const start = state.customStartDate ? new Date(state.customStartDate).getTime() : 0;
+                    const end = state.customEndDate ? new Date(state.customEndDate.replace(/-/g, '/') + ' 23:59:59').getTime() : Infinity; 
+                    
+                    return validRecords.filter(r => {
+                        const t = new Date(r.date.replace(/-/g, '/')).getTime();
+                        return t >= start && t <= end;
+                    });
+                }
+                
+                const latestDate = new Date(validRecords[validRecords.length - 1].date.replace(/-/g, '/'));
+                let days = state.graphPeriod === '1w' ? 7 : state.graphPeriod === '1m' ? 30 : 90;
+                
+                const limit = new Date(latestDate);
+                limit.setDate(limit.getDate() - days);
+                
+                return validRecords.filter(r => new Date(r.date.replace(/-/g, '/')) >= limit);
+            };
+
+            let filteredRecords = filterByPeriod(u.allRecords);
+            let labels = [];
+
+            if (filteredRecords.length === 0) {
+                labels = [...Array(7)].map((_, i) => {
+                    const d = new Date();
+                    d.setDate(d.getDate() - (6 - i));
+                    return formatDate(d).substring(5, 10);
+                });
+                filteredRecords = labels.map(() => ({})); 
+            } else {
+                labels = filteredRecords.map(r => r.date?.substring(5, 10) || '');
+            }
+
+            const common = { 
+                responsive: true, 
+                maintainAspectRatio: false, 
+                interaction: { mode: 'index', intersect: false }, 
+                plugins: { legend: { labels: { usePointStyle: true, font: { size: 9, weight: 'bold' } } } },
+                elements: { line: { tension: 0 } },
+                scales: {
+                    x: { ticks: { font: { size: 8 } } },
+                    y: { ticks: { font: { size: 8 } } }
+                }
+            };
+            
+            const createNumericChart = (ctxId, itemKey, title, colorCode, min, max) => {
+                const ctx = document.getElementById(ctxId);
+                if (ctx) {
+                    const isTemp = itemKey === 'temp';
+                    const isSleep = itemKey === 'sleepTime';
+                    const mult = isSleep ? 1/60 : 1;
+
+                    chartInstances[ctxId] = new Chart(ctx, { 
+                        type: 'line', 
+                        data: { 
+                            labels: labels, 
+                            datasets: [
+                                { label: title, data: filteredRecords.map(r => { const v = getValidVital(itemKey, r[itemKey]); return v !== null ? v * mult : null; }), borderColor: colorCode, backgroundColor: colorCode, spanGaps: true, pointRadius: 2, order: 1 }, 
+                                { label: `平均(${title})`, data: Array(filteredRecords.length).fill(u.overallAverages[itemKey] !== undefined ? u.overallAverages[itemKey] * mult : null), borderColor: '#94a3b8', backgroundColor: '#94a3b8', borderDash: [4, 4], pointRadius: 0, borderWidth: 1.5, order: 2 }
+                            ] 
+                        }, 
+                        options: { 
+                            ...common, 
+                            scales: { x: common.scales.x, y: { ...common.scales.y, suggestedMin: min, suggestedMax: max } },
+                            plugins: {
+                                ...common.plugins,
+                                tooltip: {
+                                    callbacks: {
+                                        label: function(context) {
+                                            if (isSleep) {
+                                                const mins = context.parsed.y * 60;
+                                                const h = Math.floor(mins / 60);
+                                                const m = Math.round(mins % 60);
+                                                const str = h > 0 ? (m > 0 ? `${h}時間${m}分` : `${h}時間`) : `${m}分`;
+                                                if (context.datasetIndex === 1) return `平均: ${str}`;
+                                                return `${title}: ${str}`;
+                                            } else {
+                                                if (context.datasetIndex === 1) return `平均: ${isTemp ? context.parsed.y.toFixed(1) : Math.floor(context.parsed.y)}`;
+                                                return `${title}: ${context.parsed.y}`;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        } 
+                    });
+                }
+            };
+
+            const createCategoryChart = (ctxId, itemKey, title, colorCode) => {
+                const ctx = document.getElementById(ctxId);
+                if (ctx) {
+                    chartInstances[ctxId] = new Chart(ctx, { 
+                        type: 'line', 
+                        data: { 
+                            labels: labels, 
+                            datasets: [
+                                { label: title, data: filteredRecords.map(r => getValidVital(itemKey, r[itemKey])), borderColor: colorCode, backgroundColor: colorCode, spanGaps: true, pointRadius: 2, order: 1 }, 
+                                { label: `平均(${title})`, data: Array(filteredRecords.length).fill(u.overallAverages[itemKey] || null), borderColor: '#94a3b8', backgroundColor: '#94a3b8', borderDash: [4, 4], pointRadius: 0, borderWidth: 1.5, order: 2 }
+                            ] 
+                        }, 
+                        options: { 
+                            ...common, 
+                            scales: { 
+                                x: common.scales.x,
+                                y: { 
+                                    ...common.scales.y,
+                                    min: 0, max: 40, 
+                                    ticks: { 
+                                        ...common.scales.y.ticks,
+                                        stepSize: 10, 
+                                        callback: function(value) { 
+                                            if(itemKey === 'medRecord') {
+                                                return {10: '問題なし', 20: 'やや問題', 30: '問題あり'}[value] || '';
+                                            }
+                                            if(itemKey === 'oralEnv') {
+                                                return {10: '問題なし', 20: '軽度(疑い)', 30: '重度(疑い)'}[value] || '';
+                                            }
+                                            return catLabels[itemKey][value] || ''; 
+                                        }
+                                    } 
+                                } 
+                            },
+                            plugins: {
+                                ...common.plugins,
+                                tooltip: {
+                                    callbacks: {
+                                        label: function(context) {
+                                            if (context.datasetIndex === 1) return `平均: ${Math.floor(context.parsed.y)}`;
+                                            const val = context.parsed.y;
+                                            
+                                            let displayLabel = catLabels[itemKey][val] || val;
+                                            if (itemKey === 'medRecord') {
+                                                const texts = {
+                                                    10: '服薬数5種類以下・服薬コンプライアンス問題なし',
+                                                    20: '服薬数5種類以上または服薬コンプライアンス問題あり',
+                                                    30: '服薬数5種類以上・服薬コンプライアンス問題あり'
+                                                }[val];
+                                                if (texts) displayLabel = texts;
+                                            }
+                                            
+                                            let labelText = `${title}: ${displayLabel}`;
+                                            
+                                            if (itemKey === 'fallHistory' && val === 20) {
+                                                const r = filteredRecords[context.dataIndex];
+                                                if (r && r.date) {
+                                                    const pastFalls = u.allRecords.filter(rec => new Date(rec.date.replace(/-/g, '/')) <= new Date(r.date.replace(/-/g, '/')) && parseFloat(rec.fallHistory) === 20);
+                                                    labelText += ` (計 ${pastFalls.length} 回)`;
+                                                }
+                                            }
+                                            return labelText;
+                                        }
+                                    }
+                                }
+                            }
+                        } 
+                    });
+                }
+            };
+
+            const bpCtx = document.getElementById('bpChart');
+            if (bpCtx) {
+                chartInstances['bpChart'] = new Chart(bpCtx, { 
+                    type: 'line', 
+                    data: { 
+                        labels: labels, 
+                        datasets: [
+                            { label: '血圧(収)', data: filteredRecords.map(r => getValidVital('sysBP', r.sysBP)), borderColor: '#3b82f6', backgroundColor: '#3b82f6', spanGaps: true, pointRadius: 2, order: 1 }, 
+                            { label: '平均(収)', data: Array(filteredRecords.length).fill(u.overallAverages.sysBP || null), borderColor: '#94a3b8', backgroundColor: '#94a3b8', borderDash: [4, 4], pointRadius: 0, borderWidth: 1.5, order: 2 },
+                            { label: '血圧(拡)', data: filteredRecords.map(r => getValidVital('diaBP', r.diaBP)), borderColor: '#0ea5e9', backgroundColor: '#0ea5e9', spanGaps: true, pointRadius: 2, order: 3 }, 
+                            { label: '平均(拡)', data: Array(filteredRecords.length).fill(u.overallAverages.diaBP || null), borderColor: '#94a3b8', backgroundColor: '#94a3b8', borderDash: [4, 4], pointRadius: 0, borderWidth: 1.5, order: 4 }
+                        ] 
+                    }, 
+                    options: { 
+                        ...common, 
+                        scales: { x: common.scales.x, y: { ...common.scales.y, suggestedMin: 60, suggestedMax: 180 } },
+                        plugins: {
+                            ...common.plugins,
+                            tooltip: {
+                                callbacks: {
+                                    label: function(context) {
+                                        if (context.datasetIndex === 1 || context.datasetIndex === 3) return `平均: ${Math.floor(context.parsed.y)}`;
+                                        return `${context.dataset.label}: ${context.parsed.y}`;
+                                    }
+                                }
+                            }
+                        }
+                    } 
+                });
+            }
+
+            createNumericChart('pulseChart', 'pulse', '脈拍', '#f59e0b', 50, 120);
+            createNumericChart('spo2Chart', 'spo2', 'SpO2', '#ef4444', 90, 100);
+            createNumericChart('tempChart', 'temp', '体温', '#10b981', 35.0, 38.0);
+            createNumericChart('bmiChart', 'bmi', 'BMI', '#6366f1', 15, 30);
+            createNumericChart('weightChart', 'weight', '体重', '#14b8a6', 30, 100);
+            createNumericChart('bloodSugarChart', 'bloodSugar', '血糖値', '#f43f5e', 80, 200);
+            createNumericChart('respRateChart', 'respRate', '呼吸数', '#06b6d4', 10, 30);
+            createNumericChart('sleepTimeChart', 'sleepTime', '睡眠時間', '#8b5cf6', 0, 12);
+            createNumericChart('waterIntakeChart', 'waterIntake', '水分量', '#3b82f6', 0, 3000);
+            createNumericChart('walkTime5mChart', 'walkTime5m', '5m歩行時間', '#14b8a6', 0, 30);
+
+            createCategoryChart('turgorChart', 'turgor', 'ツルゴール', '#8b5cf6');
+            createCategoryChart('anorexiaChart', 'anorexia', '食欲不振', '#84cc16');
+            createCategoryChart('medRecordChart', 'medRecord', '服薬記録', '#10b981');
+            createCategoryChart('backPainChart', 'backPain', '背部痛', '#3b82f6');
+            createCategoryChart('urinationPainChart', 'urinationPain', '排尿時痛', '#d946ef');
+            createCategoryChart('anginaChart', 'angina', '狭心痛', '#f59e0b');
+            createCategoryChart('oralEnvChart', 'oralEnv', '口腔環境', '#0ea5e9');
+            createCategoryChart('fallHistoryChart', 'fallHistory', '転倒歴', '#ef4444');
+            
+            const tCtx = document.getElementById('trendChart');
+            if (tCtx) {
+                const trendDatasets = [
+                    { label: '基準(±0)', data: Array(filteredRecords.length).fill(0), borderColor: '#94a3b8', borderDash: [5, 5], pointRadius: 0, order: 10 }
+                ];
+
+                const addTrendIfValid = (itemKey, label, color) => {
+                    if (filteredRecords.some(r => r.deviations?.[itemKey] !== undefined && r.deviations?.[itemKey] !== null)) {
+                        trendDatasets.push({ label: label, data: filteredRecords.map(r => r.deviations?.[itemKey] ?? null), borderColor: color, spanGaps: true, pointRadius: 2 });
+                    }
+                };
+
+                addTrendIfValid('sysBP', '血圧(収)', '#3b82f6');
+                addTrendIfValid('diaBP', '血圧(拡)', '#0ea5e9');
+                addTrendIfValid('pulse', '脈拍', '#f59e0b');
+                addTrendIfValid('spo2', 'SpO2', '#ef4444');
+                addTrendIfValid('temp', '体温', '#10b981');
+                addTrendIfValid('bmi', 'BMI', '#6366f1');
+                addTrendIfValid('weight', '体重', '#14b8a6');
+                addTrendIfValid('bloodSugar', '血糖値', '#f43f5e');
+                addTrendIfValid('respRate', '呼吸数', '#06b6d4');
+                addTrendIfValid('sleepTime', '睡眠時間', '#8b5cf6');
+                addTrendIfValid('waterIntake', '水分量', '#3b82f6');
+                addTrendIfValid('walkTime5m', '5m歩行', '#14b8a6');
+                addTrendIfValid('turgor', 'ツルゴール', '#8b5cf6');
+                addTrendIfValid('anorexia', '食欲不振', '#84cc16');
+                addTrendIfValid('medRecord', '服薬記録', '#10b981');
+                addTrendIfValid('backPain', '背部痛', '#3b82f6');
+                addTrendIfValid('urinationPain', '排尿時痛', '#d946ef');
+                addTrendIfValid('angina', '狭心痛', '#f59e0b');
+                addTrendIfValid('oralEnv', '口腔環境', '#0ea5e9');
+                addTrendIfValid('fallHistory', '転倒歴', '#ef4444');
+
+                chartInstances['trendChart'] = new Chart(tCtx, { 
+                    type: 'line', 
+                    data: { 
+                        labels: labels, 
+                        datasets: trendDatasets
+                    }, 
+                    options: { ...common, scales: { x: common.scales.x, y: { ...common.scales.y, suggestedMin: -20, suggestedMax: 20 } } } 
+                });
+            }
+        }
+
+        initApp();
+    </script>
+</body>
+</html>
